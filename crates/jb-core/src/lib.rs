@@ -8,6 +8,7 @@
 pub mod backup;
 pub mod backup_store;
 pub mod config;
+pub mod firstgen;
 pub mod flash;
 pub mod gpt;
 pub mod ota;

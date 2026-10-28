@@ -27,10 +27,14 @@ fn main() -> anyhow::Result<()> {
     if let Some(v) = ver {
         println!("loader OTA version: {v}");
     }
-    let mut s = match bring_up(&config, &loader, None, &|_| {}) {
-        Ok(s) => s,
+    let (up, _serial) = match bring_up(&config, &loader, None, &|_| {}, None) {
+        Ok(v) => v,
         Err(BringUpError::LoaderRejected) => anyhow::bail!("BootROM rejected the loader"),
         Err(e) => return Err(e.into()),
+    };
+    let mut s = match up {
+        jb_core::session::BroughtUp::Ours(s) => s,
+        _ => anyhow::bail!("unexpected first-generation persona — this probe needs our usbplug"),
     };
     let info = s.flash_detect()?;
     println!(

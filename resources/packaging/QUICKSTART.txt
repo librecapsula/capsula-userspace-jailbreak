@@ -22,6 +22,16 @@ capsula-jb — quick start
 3. Run:
    capsula-jb            (full scenario: dump -> adbd overlay -> reboot)
 
+   Backups are stored per speaker serial in backup/<serial>/. If a
+   valid backup of that serial already exists, the dump is skipped and
+   the tool goes straight to writing userdata (delete the folder to
+   force a fresh dump).
+
+   First-generation ("gift") speakers are detected automatically: no
+   full backup is possible on them (the tool explains why), it offers
+   to flash a freshly built userdata with the adbd overlay instead —
+   existing userdata content is lost in that mode.
+
    Useful variants:
    capsula-jb backup     dump all partitions only, nothing is written
    capsula-jb --help     all options

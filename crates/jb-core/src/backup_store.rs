@@ -47,6 +47,26 @@ impl BackupStore {
         format!("{:02}_{}.img", idx, sanitize(name))
     }
 
+    /// Backup directory name for a device serial (`backup/<dir_name>`).
+    /// The serial is USB-reported and normally hex-ish; sanitize anyway.
+    /// An empty serial maps to "unknown" — and callers must never trust
+    /// a cached "unknown" backup (no identity behind it).
+    pub fn dir_name(serial: &str) -> String {
+        let s = sanitize(serial.trim());
+        if s.is_empty() {
+            "unknown".to_string()
+        } else {
+            s
+        }
+    }
+
+    /// Is there a complete (SUCCESS.txt) and checksum-valid backup at
+    /// `dir`? The cheap gate for "skip the dump, go straight to the
+    /// userdata write".
+    pub fn exists_verified(dir: &Path) -> bool {
+        Self::open(dir).and_then(|s| s.verify()).is_ok()
+    }
+
     /// Open an existing backup: SUCCESS.txt is mandatory; the file map
     /// comes from partition_table.tsv (if present) or the NN_*.img mask.
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
@@ -171,6 +191,42 @@ mod tests {
     fn image_name_format() {
         assert_eq!(BackupStore::image_name(3, "boot_a"), "03_boot_a.img");
         assert_eq!(BackupStore::image_name(11, "userdata"), "11_userdata.img");
+    }
+
+    #[test]
+    fn dir_name_sanitizes_serials() {
+        assert_eq!(BackupStore::dir_name("01139EB3613ABD80"), "01139EB3613ABD80");
+        assert_eq!(BackupStore::dir_name("e5fe5a07c23ce39a"), "e5fe5a07c23ce39a");
+        assert_eq!(BackupStore::dir_name("../evil/serial"), ".._evil_serial");
+        assert_eq!(BackupStore::dir_name("  "), "unknown");
+        assert_eq!(BackupStore::dir_name(""), "unknown");
+    }
+
+    #[test]
+    fn exists_verified_gates_on_success_and_checksums() {
+        let tmp = std::env::temp_dir().join(format!("jb-store-ev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // empty dir -> false
+        assert!(!BackupStore::exists_verified(&tmp));
+        // SUCCESS but no sums -> false
+        std::fs::write(tmp.join("SUCCESS.txt"), "SUCCESS").unwrap();
+        assert!(!BackupStore::exists_verified(&tmp));
+        // complete: one image + matching sum -> true
+        let img = b"partition-bytes".to_vec();
+        std::fs::write(tmp.join("01_sec.img"), &img).unwrap();
+        let hex = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&img);
+            hex::encode(h.finalize())
+        };
+        std::fs::write(tmp.join("SHA256SUMS.txt"), format!("{hex}  01_sec.img\n")).unwrap();
+        assert!(BackupStore::exists_verified(&tmp));
+        // corrupt the image -> false (checksum mismatch)
+        std::fs::write(tmp.join("01_sec.img"), b"tampered").unwrap();
+        assert!(!BackupStore::exists_verified(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

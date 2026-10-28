@@ -20,6 +20,12 @@ use std::path::Path;
 /// show up at the root of the running system.
 pub const UPPER_DIR: &str = "/overlay/upper";
 
+/// Dirs the stock boot scripts expect to exist in userdata: overlayfs
+/// needs an EMPTY workdir next to the upper layer (S23overlayfs.sh
+/// mounts workdir=/data/overlay/work). Created on fresh images; on
+/// dumps they already exist (mkdir is a no-op).
+pub const LAYOUT_DIRS: &[&str] = &["/overlay", UPPER_DIR, "/overlay/work"];
+
 /// adbd build (aarch64/glibc; built in docker/adbd, linked against
 /// glibc 2.31 / OpenSSL 1.1 — runs on the stock rootfs). Listens on
 /// USB and TCP:5555 at once (ADBD_TCP_PORT overrides the port).
@@ -118,6 +124,9 @@ pub fn build_image(
     };
 
     let fs = Ext4Fs::mount(device, false).map_err(|e| UserDataError::NotExt(e.to_string()))?;
+    for dir in LAYOUT_DIRS {
+        mkdir_all(&fs, Path::new(dir))?;
+    }
     for f in files {
         write_file(&fs, f).map_err(|e| no_space(e, &f.path))?;
         progress(Progress::Step(format!(
@@ -262,11 +271,12 @@ mod tests {
         )
         .expect("fresh build");
         assert!(out.metadata().unwrap().len() >= 4 * 1024 * 1024);
-        // the upper layer is in place
+        // the upper layer and the empty overlayfs workdir are in place
         {
             let dev = FileBlockDevice::open_read_only(&out).unwrap();
             let fs = Ext4Fs::mount(dev, true).unwrap();
             assert!(fs.is_dir("/overlay/upper"), "no /overlay/upper");
+            assert!(fs.is_dir("/overlay/work"), "no /overlay/work");
             assert!(fs.is_file("/overlay/upper/usr/bin/adbd"));
             let _ = fs.umount();
         }

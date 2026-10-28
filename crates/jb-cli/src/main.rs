@@ -20,10 +20,13 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use jb_core::backup_store::BackupStore;
 use jb_core::config::Config;
-use jb_core::session::{bring_up, BringUpError, Progress};
+use jb_core::firstgen::is_first_generation;
+use jb_core::session::{
+    attach_stock_loader, bring_up, BringUpError, BroughtUp, Progress,
+};
 use jb_core::{backup, flash, ota, userdata};
 use rockusb::loader::RESET_SUBCODE_NORMAL;
-use rockusb::{LoaderContainer, NusbTransport};
+use rockusb::{DeviceMode, LoaderContainer, NusbTransport};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -114,9 +117,31 @@ fn ensure_loader(config: &Config) -> anyhow::Result<LoaderContainer> {
     Ok(container)
 }
 
-/// Steps 1-3: loader, device, full dump into backup/, with automatic
-/// WinUSB driver supervision on Windows. Returns the live usbplug
-/// session (usable for the subsequent write).
+/// The live device as the CLI flows see it (after bring-up).
+enum Device {
+    /// Our usbplug in RAM. `dumped`: a fresh backup was taken this run
+    /// (false = a verified backup for this serial already existed).
+    Ours {
+        session: rockusb::LoaderSession<NusbTransport>,
+        serial: String,
+        dumped: bool,
+    },
+    /// First generation: the stock u-boot rockusb loader (330d) with a
+    /// gift serial — no backup possible, userdata flashes through it.
+    StockLoader {
+        session: rockusb::LoaderSession<NusbTransport>,
+        serial: String,
+    },
+}
+
+/// Backup directory for a column: backup/<sanitized serial>.
+fn backup_dir(serial: &str) -> PathBuf {
+    Path::new("backup").join(BackupStore::dir_name(serial))
+}
+
+/// Steps 1-3 (loader, device, full dump into backup/) for regular
+/// columns; for first-generation personas the same session mechanics,
+/// but no backup — that hardware cannot run our usbplug.
 ///
 /// On Windows the board hops between devnodes (330d loader, 330e
 /// MaskROM/usbplug) and a fresh devnode may be grabbed by a vendor
@@ -126,7 +151,7 @@ fn ensure_loader(config: &Config) -> anyhow::Result<LoaderContainer> {
 fn dump_all(
     wait: Option<Duration>,
     drivers: &mut win_drv::Session,
-) -> anyhow::Result<rockusb::LoaderSession<NusbTransport>> {
+) -> anyhow::Result<Device> {
     if win_drv::any_rockchip_node_misbound() {
         println!("a Rockchip device is present without WinUSB — installing the driver");
         start_or_wait_drivers(drivers, Duration::from_secs(180));
@@ -190,38 +215,143 @@ fn start_or_wait_drivers(drivers: &mut win_drv::Session, settle: Duration) {
 }
 
 /// One bring-up + dump attempt (no retries).
-fn dump_all_once(wait: Option<Duration>) -> anyhow::Result<rockusb::LoaderSession<NusbTransport>> {
+fn dump_all_once(wait: Option<Duration>) -> anyhow::Result<Device> {
     let config = Config::embedded();
-    let loader = ensure_loader(&config)?;
 
+    // Classify what is already on the bus before the OTA download: the
+    // loader cache is pointless on a first-generation column (our
+    // usbplug never runs on it), and the emergency fastboot state is a
+    // hard stop with a clear instruction. The loader serial read here
+    // is THE session identity — bring_up will not read it again.
+    let mut known_serial: Option<String> = None;
+    match rockusb::current_mode().context("USB bus")? {
+        Some(DeviceMode::Fastboot) => bail!(
+            "the device is in its EMERGENCY fastboot state (18d1:d00d): \
+             power-cycle it and re-enter loader mode (recovery button), \
+             then run the tool again"
+        ),
+        Some(DeviceMode::Loader) => {
+            let serial =
+                rockusb::device_serial(&DeviceMode::Loader).unwrap_or_default();
+            if is_first_generation(&serial) {
+                let p = progress::CliProgress::new();
+                let session = attach_stock_loader(&|ev| p.handle(ev))
+                    .context("first-generation stock loader")?;
+                return Ok(Device::StockLoader { session, serial });
+            }
+            known_serial = Some(serial);
+        }
+        _ => {}
+    }
+
+    let loader = ensure_loader(&config)?;
     let p = progress::CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
-    let mut s = match bring_up(&config, &loader, wait, &progress) {
-        Ok(s) => s,
+    let (up, serial) = match bring_up(&config, &loader, wait, &progress, known_serial) {
+        Ok(v) => v,
         Err(BringUpError::LoaderRejected) => bail!(
-            "usbplug did not start: BootROM rejected the loader signature (unsupported board?)"
+            "usbplug did not start: BootROM rejected the loader signature \
+             (unsupported board? a first-generation column in MaskROM — \
+             release the recovery button and re-enter download mode)"
         ),
         Err(e) => return Err(e.into()),
     };
-    backup::backup(&mut s, &config, Path::new("backup"), &progress)?;
-    Ok(s)
+    match up {
+        BroughtUp::Ours(mut s) => {
+            if jb_core::session::is_identifying(&serial) {
+                println!("column serial: {serial}");
+            } else {
+                println!(
+                    "warning: the column did not show up as 330d, its serial is \
+                     unknown — the backup goes to {} and will NOT be reused as \
+                     a cache; re-enter loader mode (recovery button) to key it \
+                     by the column serial",
+                    backup_dir(&serial).display()
+                );
+            }
+            let dir = backup_dir(&serial);
+            // A verified backup of THIS column exists -> skip the dump
+            // and go straight to the userdata write. Only an identifying
+            // serial (read from the loader persona) may unlock the cache.
+            let dumped =
+                if jb_core::session::is_identifying(&serial) && BackupStore::exists_verified(&dir)
+                {
+                    println!(
+                        "backup {} already exists and verifies — skipping the dump \
+                         (delete it to force a fresh one)",
+                        dir.display()
+                    );
+                    false
+                } else {
+                    backup::backup(&mut s, &config, &dir, &progress)?;
+                    if jb_core::session::is_identifying(&serial) {
+                        let _ = std::fs::write(dir.join("serial.txt"), &serial);
+                    }
+                    true
+                };
+            Ok(Device::Ours {
+                session: s,
+                serial,
+                dumped,
+            })
+        }
+        BroughtUp::FirstGenStockLoader(session) => Ok(Device::StockLoader { session, serial }),
+    }
 }
 
 /// `capsula-jb backup`: dump only.
 fn run_backup(wait: Option<Duration>) -> anyhow::Result<()> {
     let mut drivers = win_drv::Session::new();
-    let _session = dump_all(wait, &mut drivers)?;
-    println!("done: dumps are in backup/ (nothing was written to the device)");
-    Ok(())
+    match dump_all(wait, &mut drivers)? {
+        Device::Ours { serial, dumped, .. } => {
+            let where_ = backup_dir(&serial).display().to_string();
+            if dumped {
+                if jb_core::session::is_identifying(&serial) {
+                    println!("done: dumps for {serial} are in {where_} (nothing was written to the device)");
+                } else {
+                    println!("done: dumps are in {where_} (nothing was written to the device)");
+                }
+            } else {
+                println!(
+                    "a verified backup of {serial} already exists in {where_} — \
+                     nothing to do (delete it to force a fresh dump)"
+                );
+            }
+            Ok(())
+        }
+        Device::StockLoader { .. } => bail!(
+            "first-generation column: its BootROM is locked and refuses our \
+             usbplug, so a full dump is not possible. Run the default command \
+             to flash the adbd overlay without a backup."
+        ),
+    }
 }
 
 /// Full jailbreak scenario (steps 1-6).
 fn run_jailbreak(wait: Option<Duration>, yes: bool, format_userdata: bool) -> anyhow::Result<()> {
     let mut drivers = win_drv::Session::new();
-    let mut s = dump_all(wait, &mut drivers)?;
+    match dump_all(wait, &mut drivers)? {
+        Device::Ours { mut session, serial, .. } => {
+            full_flow(&mut session, &serial, yes, format_userdata, wait)
+        }
+        Device::StockLoader { mut session, serial } => {
+            firstgen_stock_flow(&mut session, &serial, yes, wait)
+        }
+    }
+}
 
-    // step 4: overlay on top of the userdata dump
-    let store = BackupStore::open(Path::new("backup")).context("no valid backup in backup/")?;
+/// Steps 4-6 over our usbplug: overlay on top of the dump, flash, reboot.
+fn full_flow(
+    s: &mut rockusb::LoaderSession<NusbTransport>,
+    serial: &str,
+    yes: bool,
+    format_userdata: bool,
+    wait: Option<Duration>,
+) -> anyhow::Result<()> {
+    // step 4: overlay on top of the userdata dump (per-serial directory;
+    // the dump was just taken or found valid by dump_all)
+    let store = BackupStore::open(&backup_dir(serial))
+        .context("no valid backup for this column — run the default command again")?;
     store
         .verify()
         .context("backup failed SHA256 verification — run backup again")?;
@@ -260,12 +390,21 @@ fn run_jailbreak(wait: Option<Duration>, yes: bool, format_userdata: bool) -> an
     // step 5: flash the partition back (same usbplug session)
     let p = progress::CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
-    let gpt = jb_core::session::read_gpt(&mut s, &progress)?;
-    flash::write_partition_padded(&mut s, &gpt, "userdata", &out, &progress)?;
+    let gpt = jb_core::session::read_gpt(s, &progress)?;
+    flash::write_partition_padded(s, &gpt, "userdata", &out, &progress)?;
 
-    // step 6: reboot and wait for ADB
+    reboot_and_wait(s, wait)
+}
+
+/// The shared tail of every flow: reboot the device and wait for the ADB
+/// gadget to come up and stay.
+fn reboot_and_wait(s: &mut rockusb::LoaderSession<NusbTransport>, wait: Option<Duration>) -> anyhow::Result<()> {
     println!("rebooting the device...");
     let _ = s.reset(RESET_SUBCODE_NORMAL);
+    wait_for_adb_gadget(wait)
+}
+
+fn wait_for_adb_gadget(wait: Option<Duration>) -> anyhow::Result<()> {
     println!(
         "waiting for the ADB gadget (2207:0006, {} s stability window)...",
         GADGET_STABLE.as_secs()
@@ -275,6 +414,62 @@ fn run_jailbreak(wait: Option<Duration>, yes: bool, format_userdata: bool) -> an
     )?;
     println!("done: ADB is up. The device accepts root shell connections.");
     Ok(())
+}
+
+/// First generation, stock rockusb loader (330d): the GPT is readable
+/// directly (LBA1 is far below any read limit); userdata is written
+/// through the stock WRITE_LBA. No backup is possible on this hardware.
+fn firstgen_stock_flow(
+    s: &mut rockusb::LoaderSession<NusbTransport>,
+    serial: &str,
+    yes: bool,
+    wait: Option<Duration>,
+) -> anyhow::Result<()> {
+    println!(
+        "first-generation column {serial} (stock loader):\n  its BootROM is \
+         locked and refuses our usbplug, so a full backup is impossible on this\n  \
+         hardware. The stock loader can still read the partition table and flash\n  \
+         userdata directly: the adbd overlay will be built fresh (existing\n  \
+         userdata content is lost)."
+    );
+
+    let p = progress::CliProgress::new();
+    let progress = |ev: Progress| p.handle(ev);
+    let gpt = jb_core::session::read_gpt(s, &progress).context(
+        "the stock loader did not return a GPT — power-cycle the device",
+    )?;
+    let part_size = gpt
+        .find("userdata")
+        .context("no userdata partition in the device GPT")?
+        .sectors
+        * 512;
+    println!("userdata partition: {} (device GPT)", humansize(part_size));
+
+    if !yes {
+        println!(
+            "about to write userdata ({}): adbd overlay on a clean ext2 — \
+             no backup is possible on a first-generation column, existing \
+             userdata content is lost",
+            humansize(part_size)
+        );
+        print!("proceed? [y/N] ");
+        ask_yes()?;
+    }
+
+    let marker = format!("capsula-jb userspace {}\n", utc_now_iso());
+    let out = PathBuf::from("work").join("userdata.img");
+    userdata::build_image(
+        Path::new(""),
+        &out,
+        true,
+        part_size,
+        &userdata::overlay_files(marker),
+        &print_step,
+    )
+    .context("failed to build the userdata image with the overlay")?;
+
+    flash::write_partition_padded(s, &gpt, "userdata", &out, &progress)?;
+    reboot_and_wait(s, wait)
 }
 
 fn ask_yes() -> anyhow::Result<()> {
