@@ -1,0 +1,22 @@
+[package]
+name = "win-drv"
+description = "Automatic WinUSB driver management for Rockchip boards (Zadig-generated packages, no manual Zadig run)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Console",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry", # SHELLEXECUTEINFOW is gated behind it
+    "Win32_Foundation",
+] }

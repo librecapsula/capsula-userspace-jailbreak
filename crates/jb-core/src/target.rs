@@ -10,8 +10,8 @@
 //! - **Amlogic** (late minis, MRC02B board, 1b8e:c003): the stock u-boot
 //!   raises its factory download window on every power-up for ~450 ms;
 //!   the sighting is acted on immediately (no debounce — the window is
-//!   half of the rockchip stability delay), and once the host identifies,
-//!   the device stays in the mode.
+//!   half of the rockchip stability delay). Identify promptly; the
+//!   lifetime of the window depends on the bootloader.
 
 use crate::session::Progress;
 use amlogic::AmlogicSession;
@@ -135,6 +135,9 @@ pub fn bring_up_amlogic(
                 // starves nothing but burns a core for minutes
                 std::thread::sleep(Duration::from_millis(10));
             }
+            Err(e @ amlogic::Error::MultipleDevices) => {
+                return Err(TargetError::AmlogicOpen(e.to_string()));
+            }
             Err(e) => {
                 if !seen {
                     log::info!(
@@ -168,17 +171,15 @@ fn open_and_identify(
     let t = Instant::now();
     let mut s = AmlogicSession::open()?;
     let opened = t.elapsed();
-    // let IOKit finish building the interface pipes before the first
-    // bulk transfer (kIOUSBUnknownPipeErr on a too-fresh device)
-    std::thread::sleep(Duration::from_millis(50));
-    let soc = s.identify()?;
+    // Identify before any settling delay. prime() already retries a
+    // transiently unavailable bulk pipe, and BootROM has no burning pipe.
     // The first bulkcmd of a session can lose its leading bytes
     // (flasher.sh prime_bulk): sacrifice a command nobody needs. A
     // failure means a dead bulk pipe — continuing would burn the whole
     // window on commands whose status nobody can read, so fail the
     // attempt and let the caller reconnect (the reference flasher fails
     // the run on a failed prime).
-    s.prime()?;
+    let soc = s.identify_and_prime()?;
     log::info!("amlogic: open +{opened:?}, identify +{:?}", t.elapsed());
     progress(Progress::Step(format!("amlogic download device: {soc}")));
     Ok((s, soc))

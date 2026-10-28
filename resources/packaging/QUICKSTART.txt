@@ -1,9 +1,16 @@
 capsula-jb — quick start
 ========================
 
-1. Windows only: run DRIVER-SETUP.txt first (one-time USB driver install;
-   Rockchip 2207 for the big Capsulas / early minis, Amlogic 1B8E:C003
-   for the late minis).
+1. For Rockchip boards, on Windows capsula-jb installs and maintains
+   the WinUSB driver binding itself. Windows will ask for administrator
+   rights (UAC) once, right at the start — that is expected: driver
+   management requires it. Started from a normal console, the elevated
+   tool runs in its own console window and waits for Enter at the end
+   so the output stays readable. See DRIVER-SETUP.txt only if something
+   unusual happens, or to switch the board back to the vendor driver
+   for RKDevTool.
+   Amlogic minis (1B8E:C003) still need a manual WinUSB setup; see the
+   Amlogic section in DRIVER-SETUP.txt before connecting the speaker.
    macOS note: if the binary is blocked after downloading, run
    `xattr -d com.apple.quarantine capsula-jb` (or see README).
    Linux note: for access without root, see the udev rules in README.
@@ -41,5 +48,6 @@ Scripted / agent use: the tool prints "proceed? [y/N]" and waits for
 input before writing userdata. With a non-interactive stdin (CI, LLM
 agents) it exits with an error instead, writing nothing — re-run with
 --yes once the write has been approved. `backup` never asks anything.
+Full agent instructions (driver toggle, safety rules): AGENTS.md.
 
 See README.md for details, safety notes and troubleshooting.

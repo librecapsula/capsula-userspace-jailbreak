@@ -20,9 +20,9 @@
 //!   full storage access.
 //!
 //! On the VK Capsula Mini the vendor u-boot raises this download mode
-//! on every power-up for ~450 ms (the factory flashing window, not
-//! password-protected); once the host identifies, the device stays in
-//! the mode. Secure boot does not gate this window on A113X.
+//! on every power-up for a short factory flashing window. Identify
+//! promptly; the window's lifetime depends on the bootloader. Secure
+//! boot does not gate this window on A113X.
 
 pub mod checksum;
 pub mod error;

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Package the release archive for the current matrix job.
-# Env: TARGET, ARCHIVE (tar.gz|zip), TAG; DRIVER_URL/DRIVER_SHA256 on Windows.
+# Env: TARGET, ARCHIVE (tar.gz|zip), TAG; DRIVER_URL/DRIVER_SHA256 and
+# ZADIG_URL/ZADIG_SHA256 on Windows.
 set -euo pipefail
 
 tag="${TAG#v}"          # 0.1.0
@@ -17,13 +18,24 @@ fi
 cp "$bin" "${stage}/"
 cp README.md LICENSE "${stage}/"
 cp resources/packaging/QUICKSTART.txt "${stage}/"
+# Agent manual for flashing (the root AGENTS.md is the dev guide and
+# intentionally does not ship).
+cp resources/packaging/AGENTS.md "${stage}/"
 
 case "$TARGET" in
     *-windows-*)
-        # Rockchip USB drivers (WinUSB for VID 2207): downloaded and
-        # SHA256-verified at build time, shipped inside the archive.
+        # Two USB driver components, both downloaded and SHA256-verified
+        # at build time, shipped inside the archive:
+        #   RockchipUSBDriver.zip — vendor DriverAssistant (the "Rockusb"
+        #     driver used by RKDevTool/upgrade_tool; also the way back
+        #     after switching the device to WinUSB);
+        #   zadig-2.9.exe — Zadig, to rebind the board to WinUSB, which
+        #     is the driver capsula-jb itself opens the device through.
+        # See resources/packaging/windows-DRIVER-SETUP.txt.
         curl -fsSL "$DRIVER_URL" -o "${stage}/RockchipUSBDriver.zip"
         echo "${DRIVER_SHA256}  ${stage}/RockchipUSBDriver.zip" | sha256sum -c
+        curl -fsSL "$ZADIG_URL" -o "${stage}/zadig-2.9.exe"
+        echo "${ZADIG_SHA256}  ${stage}/zadig-2.9.exe" | sha256sum -c
         cp resources/packaging/windows-DRIVER-SETUP.txt "${stage}/DRIVER-SETUP.txt"
         ;;
     *-linux-*)

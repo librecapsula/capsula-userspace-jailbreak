@@ -16,6 +16,10 @@ pub enum Step {
     BulkOut(Vec<u8>),
     /// Answer a bulk read with these bytes (exhaustion is an error).
     BulkIn(Vec<u8>),
+    /// Fail the next bulk read, simulating a USB disconnect or timeout.
+    BulkError(String),
+    /// A single native completion can deliver data together with an error.
+    BulkPartialError(Vec<u8>, String),
 }
 
 #[derive(Default)]
@@ -117,6 +121,17 @@ impl Transport for MockTransport {
                     buf[filled..filled + data.len()].copy_from_slice(&data);
                     filled += data.len();
                 }
+                Step::BulkError(message) => return Err(Error::Usb(message)),
+                Step::BulkPartialError(data, reason) => {
+                    if data.len() > buf.len() - filled {
+                        return Err(Error::Usb("mock: partial read would overflow".into()));
+                    }
+                    buf[filled..filled + data.len()].copy_from_slice(&data);
+                    return Err(Error::PartialRead {
+                        transferred: filled + data.len(),
+                        reason,
+                    });
+                }
                 other => return Err(Error::Usb(format!("mock: expected data, got {other:?}"))),
             }
         }
@@ -131,9 +146,19 @@ impl Transport for MockTransport {
                     return Err(Error::Usb("mock: bulk_read_upto would overflow".into()));
                 }
                 buf[..data.len()].copy_from_slice(&data);
-                self.log
-                    .push(format!("in ep{endpoint:#x} {}b", data.len()));
+                self.log.push(format!("in ep{endpoint:#x} {}b", data.len()));
                 Ok(data.len())
+            }
+            Step::BulkError(message) => Err(Error::Usb(message)),
+            Step::BulkPartialError(data, reason) => {
+                if data.len() > buf.len() {
+                    return Err(Error::Usb("mock: partial read would overflow".into()));
+                }
+                buf[..data.len()].copy_from_slice(&data);
+                Err(Error::PartialRead {
+                    transferred: data.len(),
+                    reason,
+                })
             }
             other => Err(Error::Usb(format!("mock: expected data, got {other:?}"))),
         }

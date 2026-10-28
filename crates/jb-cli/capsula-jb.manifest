@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!-- The tool manages USB drivers (machine cert stores, the driver
+       store, devnode binding), which needs a fully elevated process.
+       Requiring it up front gives ONE UAC prompt before any work
+       begins, so nothing ever runs twice (no helper, no mid-flow
+       elevation races). Launched from a non-elevated console, the
+       elevated instance gets its own console window; the CLI pauses at
+       exit when it detects that window was created for it. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

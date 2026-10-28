@@ -13,8 +13,9 @@
 use crate::error::{Error, Result};
 use crate::soc::SocId;
 use crate::{add_sum, req};
+use std::io::Write;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use usbcore::Transport;
 
 /// u16 block count per control transfer (pyamlboot MAX_LARGE_BLOCK_COUNT).
@@ -42,6 +43,7 @@ pub const NAND_STAGE: usize = 256 * 1024;
 /// Pause between `Continue:` status polls (the reference flasher
 /// re-polls every 20 ms; 50 ms is still instant on the command scale).
 const CONTINUE_PAUSE: Duration = Duration::from_millis(50);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A session with an Amlogic SoC in a USB download mode.
 pub struct AmlogicSession<T: Transport> {
@@ -65,14 +67,10 @@ impl AmlogicSession<usbcore::NusbTransport> {
         Ok(self.transport.reset()?)
     }
 
-    /// Open the first `1b8e:c003` device (either download stage) and
-    /// claim interface 0.
+    /// Open the only `1b8e:c003` device and claim interface 0.
+    /// Refuse an ambiguous bus before opening either board.
     pub fn open() -> Result<Self> {
-        let t = usbcore::NusbTransport::open_first(
-            crate::USB_VID_AMLOGIC,
-            crate::USB_PID_UPDATE,
-            |_| true,
-        )?;
+        let t = usbcore::NusbTransport::open_unique(crate::USB_VID_AMLOGIC, crate::USB_PID_UPDATE)?;
         let (ep_in, ep_out) = (t.ep_in, t.ep_out);
         Ok(AmlogicSession::new(t, ep_in, ep_out))
     }
@@ -98,12 +96,27 @@ impl<T: Transport> AmlogicSession<T> {
     }
 
     /// Identify the device (AM_REQ_IDENTIFY_HOST): protocol version and
-    /// boot stage. Also clears the u-boot auto-burn timeout, so call it
-    /// promptly after the device appears.
+    /// boot stage. Call promptly while the download window is open;
+    /// its lifetime depends on the board's bootloader.
     pub fn identify(&mut self) -> Result<SocId> {
         let mut buf = [0u8; 8];
         let n = self.ctrl_in(req::IDENTIFY_HOST, 0, 0, &mut buf)?;
-        SocId::parse(&buf[..n]).ok_or(Error::Usb("identify reply too short".into()))
+        if !(4..=buf.len()).contains(&n) || buf[..4].iter().all(|&b| b == 0) {
+            return Err(Error::InvalidResponse(format!(
+                "invalid identify reply ({n} bytes)"
+            )));
+        }
+        SocId::parse(&buf[..n])
+            .ok_or_else(|| Error::InvalidResponse("identify reply too short".into()))
+    }
+
+    /// Identify a session; only TPL supports the burning-command prime.
+    pub fn identify_and_prime(&mut self) -> Result<SocId> {
+        let soc = self.identify()?;
+        if soc.stage() == crate::Stage::Tpl {
+            self.prime()?;
+        }
+        Ok(soc)
     }
 
     /// Write up to 64 bytes to memory (AM_REQ_WRITE_MEM).
@@ -237,6 +250,9 @@ impl<T: Transport> AmlogicSession<T> {
     /// at 63 chars (the device truncates at 64 silently and then
     /// answers half a command with a syntax error nobody reports).
     pub fn send_bulk_cmd(&mut self, cmd: &str) -> Result<()> {
+        if cmd.as_bytes().contains(&0) {
+            return Err(Error::InvalidArgument("command contains NUL".into()));
+        }
         if cmd.len() > BULKCMD_MAX {
             return Err(Error::CommandTooLong(cmd.to_string()));
         }
@@ -259,32 +275,24 @@ impl<T: Transport> AmlogicSession<T> {
             match self.bulk_cmd("echo") {
                 // the pipe works — the reply text is meaningless here
                 Ok(_) | Err(Error::CommandFailed(_)) => return Ok(()),
-                Err(e) => {
+                Err(e @ Error::Usb(_)) => {
                     if attempt == 7 {
                         return Err(e);
                     }
                     sleep(Duration::from_millis(50));
                 }
+                Err(e) => return Err(e),
             }
         }
         unreachable!()
     }
 
     /// Poll the bulk status until the running command finishes.
-    /// `Continue:xx` means "still executing".
+    /// `Continue:xx` means "still executing". Polling stops after 30 s;
+    /// a transfer already in flight is bounded by the transport timeout.
     pub fn wait_bulk_status(&mut self) -> Result<String> {
-        loop {
-            let text = self.read_bulk_reply()?;
-            if text.starts_with("Continue:") {
-                log::info!("amlogic: {text} — waiting");
-                sleep(CONTINUE_PAUSE);
-                continue;
-            }
-            if text.starts_with("success") {
-                return Ok(text);
-            }
-            return Err(Error::CommandFailed(text));
-        }
+        let start = Instant::now();
+        poll_status(|| self.read_bulk_reply(), || start.elapsed(), sleep)
     }
 
     /// One 512-byte bulk-IN status reply, NUL-trimmed. Read UP TO 512 in
@@ -294,9 +302,12 @@ impl<T: Transport> AmlogicSession<T> {
     /// of the earlier revisions.
     pub fn read_bulk_reply(&mut self) -> Result<String> {
         let mut buf = [0u8; BULK_REPLY_LEN];
-        let n = self
-            .transport
-            .bulk_read_upto(self.ep_in, &mut buf)?;
+        let n = self.transport.bulk_read_upto(self.ep_in, &mut buf)?;
+        if n == 0 || n > buf.len() {
+            return Err(Error::InvalidResponse(format!(
+                "invalid bulk status length: {n}"
+            )));
+        }
         let text = nul_trim(&buf[..n]);
         log::debug!("amlogic: bulk reply {n}b: {text}");
         Ok(text)
@@ -306,6 +317,9 @@ impl<T: Transport> AmlogicSession<T> {
     /// result with AM_REQ_TPL_STAT (a 64-byte EP0 reply instead of the
     /// bulk one). The burning tool uses this channel for `download`.
     pub fn tpl_cmd(&mut self, cmd: &str) -> Result<String> {
+        if cmd.as_bytes().contains(&0) {
+            return Err(Error::InvalidArgument("command contains NUL".into()));
+        }
         let mut cmd = cmd.to_string();
         cmd.push('\0');
         if cmd.len() >= 128 {
@@ -315,20 +329,24 @@ impl<T: Transport> AmlogicSession<T> {
         self.tpl_stat()
     }
 
-    /// Fetch the TPL command result (AM_REQ_TPL_STAT).
+    /// Fetch the TPL command result (AM_REQ_TPL_STAT), polling within
+    /// the same 30-second status deadline as bulk commands.
     pub fn tpl_stat(&mut self) -> Result<String> {
-        let mut buf = [0u8; 0x40];
-        self.ctrl_in(req::TPL_STAT, 0, 0, &mut buf)?;
-        let text = nul_trim(&buf);
-        if text.starts_with("Continue:") {
-            log::info!("amlogic: {text} — waiting");
-            sleep(CONTINUE_PAUSE);
-            return self.tpl_stat();
-        }
-        if text.starts_with("success") {
-            return Ok(text);
-        }
-        Err(Error::CommandFailed(text))
+        let start = Instant::now();
+        poll_status(
+            || {
+                let mut buf = [0u8; 0x40];
+                let n = self.ctrl_in(req::TPL_STAT, 0, 0, &mut buf)?;
+                if n == 0 || n > buf.len() {
+                    return Err(Error::InvalidResponse(format!(
+                        "invalid TPL status length: {n}"
+                    )));
+                }
+                Ok(nul_trim(&buf[..n]))
+            },
+            || start.elapsed(),
+            sleep,
+        )
     }
 
     /// One `download` media packet (AM_REQ_WRITE_MEDIA): `data` (at most
@@ -388,12 +406,27 @@ impl<T: Transport> AmlogicSession<T> {
     /// read_exact. `hint` only feeds the vendor tool's 4 KiB page
     /// accounting in wIndex — wire fidelity, no effect on the device.
     pub fn upload_fetch(&mut self, hint: usize) -> Result<(Vec<u8>, [u8; 16])> {
+        self.upload_fetch_bounded(hint, UPLOAD_SLOT)
+    }
+
+    fn upload_fetch_bounded(
+        &mut self,
+        hint: usize,
+        remaining: usize,
+    ) -> Result<(Vec<u8>, [u8; 16])> {
+        let (head, size) = self.upload_head(hint, remaining)?;
+        let mut data = Vec::with_capacity(size);
+        self.read_upload_payload(size, &mut data, &|_| {})?;
+        Ok((data, head))
+    }
+
+    fn upload_head(&mut self, hint: usize, remaining: usize) -> Result<([u8; 16], usize)> {
         let want = hint.clamp(1, UPLOAD_SLOT);
         let blocks = (want.div_ceil(0x1000)) as u16;
         let mut head = [0u8; 16];
         let n = self.ctrl_in(req::READ_MEDIA, 0x1000, blocks, &mut head)?;
         if n != 16 {
-            return Err(Error::Usb(format!(
+            return Err(Error::InvalidResponse(format!(
                 "short upload head: {n} of 16 bytes (session dead?)"
             )));
         }
@@ -401,16 +434,46 @@ impl<T: Transport> AmlogicSession<T> {
         // copies it into bulk_data_len); a garbage head means a dead
         // or desynchronized session.
         let left = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
-        if left > UPLOAD_SLOT {
-            return Err(Error::Usb(format!(
-                "upload head announces {left:#x} bytes — beyond the device slot"
+        if left > UPLOAD_SLOT || left > remaining {
+            return Err(Error::InvalidResponse(format!(
+                "upload head announces {left:#x} bytes for {remaining:#x} remaining (slot {UPLOAD_SLOT:#x})"
             )));
         }
-        let mut data = vec![0u8; left];
-        if left > 0 {
-            self.transport.bulk_read(self.ep_in, &mut data)?;
+        Ok((head, left))
+    }
+
+    /// Deliver every completed USB read immediately, so a later link
+    /// failure cannot discard the already received prefix.
+    fn read_upload_payload(
+        &mut self,
+        size: usize,
+        out: &mut dyn Write,
+        progress: &dyn Fn(usize),
+    ) -> Result<()> {
+        let mut buf = [0u8; UPLOAD_SLOT];
+        let mut received = 0;
+        while received < size {
+            let want = size - received;
+            let (n, failure) = match self.transport.bulk_read_upto(self.ep_in, &mut buf[..want]) {
+                Ok(n) => (n, None),
+                Err(error @ usbcore::Error::PartialRead { transferred, .. }) => {
+                    (transferred, Some(error))
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if n == 0 || n > want {
+                return Err(Error::InvalidResponse(format!(
+                    "upload payload: got {n} bytes for {want} remaining"
+                )));
+            }
+            out.write_all(&buf[..n])?;
+            received += n;
+            progress(received);
+            if let Some(error) = failure {
+                return Err(error.into());
+            }
         }
-        Ok((data, head))
+        Ok(())
     }
 
     /// Stream an armed `upload ...` command to completion: sequential
@@ -425,18 +488,30 @@ impl<T: Transport> AmlogicSession<T> {
         progress: &dyn Fn(usize),
     ) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(total.min(1 << 20));
-        while out.len() < total {
+        self.receive_upload_to(total, stop, &mut out, progress)?;
+        Ok(out)
+    }
+
+    fn receive_upload_to(
+        &mut self,
+        total: usize,
+        stop: &dyn Fn() -> bool,
+        out: &mut dyn Write,
+        progress: &dyn Fn(usize),
+    ) -> Result<usize> {
+        let mut received = 0;
+        while received < total {
             if stop() {
                 break;
             }
-            let (data, _head) = self.upload_fetch(total - out.len())?;
-            if data.is_empty() {
+            let (_, size) = self.upload_head(total - received, total - received)?;
+            if size == 0 {
                 break;
             }
-            out.extend_from_slice(&data);
-            progress(out.len());
+            self.read_upload_payload(size, out, &|n| progress(received + n))?;
+            received += size;
         }
-        Ok(out)
+        Ok(received)
     }
 
     /// u-boot gadget stage: read DRAM via the `upload mem <addr> normal
@@ -445,7 +520,9 @@ impl<T: Transport> AmlogicSession<T> {
     /// `size`, streamed in device-paced [`UPLOAD_SLOT`] bursts.
     pub fn upload_read(&mut self, addr: u32, size: usize) -> Result<Vec<u8>> {
         if size == 0 || size > 0x80_0000 {
-            return Err(Error::Usb(format!("upload mem size {size:#x} out of 1..=0x800000")));
+            return Err(Error::Usb(format!(
+                "upload mem size {size:#x} out of 1..=0x800000"
+            )));
         }
         let cmd = format!("upload mem {addr:#x} normal {size:#x}");
         self.send_bulk_cmd(&cmd)?;
@@ -453,14 +530,7 @@ impl<T: Transport> AmlogicSession<T> {
         // itself arrives via upload_fetch bursts
         let status = self.wait_bulk_status()?;
         log::debug!("upload armed: {status}");
-        let out = self.receive_upload(size, &|| false, &|_| {})?;
-        if out.len() != size {
-            return Err(Error::Usb(format!(
-                "upload mem {addr:#x}: got {:#x} of {size:#x} bytes",
-                out.len()
-            )));
-        }
-        Ok(out)
+        self.finish_dram_read(addr, size, &|_| {})
     }
 
     /// Read a DRAM range (one `upload mem` arm + device-paced bursts).
@@ -471,12 +541,30 @@ impl<T: Transport> AmlogicSession<T> {
         progress: &dyn Fn(usize),
     ) -> Result<Vec<u8>> {
         if size == 0 || size > 0x80_0000 {
-            return Err(Error::Usb(format!("upload mem size {size:#x} out of 1..=0x800000")));
+            return Err(Error::Usb(format!(
+                "upload mem size {size:#x} out of 1..=0x800000"
+            )));
         }
         self.send_bulk_cmd(&format!("upload mem {addr:#x} normal {size:#x}"))?;
         let status = self.wait_bulk_status()?;
         log::debug!("upload armed: {status}");
-        self.receive_upload(size, &|| false, progress)
+        self.finish_dram_read(addr, size, progress)
+    }
+
+    fn finish_dram_read(
+        &mut self,
+        addr: u32,
+        size: usize,
+        progress: &dyn Fn(usize),
+    ) -> Result<Vec<u8>> {
+        let data = self.receive_upload(size, &|| false, progress)?;
+        if data.len() != size {
+            return Err(Error::InvalidResponse(format!(
+                "upload mem {addr:#x}: got {:#x} of {size:#x} bytes",
+                data.len()
+            )));
+        }
+        Ok(data)
     }
 
     /// `nand read <ram> <off> <len>` — raw-offset NAND read into DRAM
@@ -574,7 +662,7 @@ impl<T: Transport> AmlogicSession<T> {
                         }
                     }
                 }
-                let (chunk, _head) = self.upload_fetch(stage - staged)?;
+                let (chunk, _head) = self.upload_fetch_bounded(stage - staged, stage - staged)?;
                 if chunk.is_empty() {
                     return Err(Error::Usb(format!(
                         "upload mem: stream ended after {staged:#x} of {stage:#x} bytes"
@@ -602,33 +690,48 @@ impl<T: Transport> AmlogicSession<T> {
         Ok(out)
     }
 
-    /// Stream a whole partition by name: one `upload store <part>
-    /// normal <total>` arm, then sequential AM_REQ_UPLOAD bursts (the
-    /// device reads the NAND slot-by-slot itself and announces every
-    /// burst in the head). A short stream (bad blocks shorten NAND
-    /// reads, the device ends the stream with an empty burst) is
-    /// returned with a warning, not an error — the vendor flasher
-    /// treats the received length as the truth.
+    /// Collect a partition upload in memory. An explicit zero upload
+    /// head returns a short stream with a warning; it does not establish
+    /// the cause of the short read. Prefer [`Self::upload_store_to`]
+    /// for long reads or when the prefix must survive a transport error.
     pub fn upload_store(
         &mut self,
         part: &str,
         total: usize,
         progress: &dyn Fn(usize),
     ) -> Result<Vec<u8>> {
-        if total == 0 {
-            return Ok(Vec::new());
-        }
-        self.bulk_cmd(&format!("upload store {part} normal {total:#x}"))
-            .map(|_| ())?;
-        let out = self.receive_upload(total, &|| false, progress)?;
-        if out.len() < total {
-            log::warn!(
-                "upload store {part}: stream ended at {:#x} of {total:#x} bytes \
-                 (bad blocks shorten the read) — keeping the short dump",
-                out.len()
-            );
-        }
+        let mut out = Vec::with_capacity(total.min(1 << 20));
+        self.upload_store_to(part, total, &mut out, progress)?;
         Ok(out)
+    }
+
+    /// Stream a known partition into a writer using at most one 64 KiB
+    /// payload buffer. A zero upload head is a short stream, not proof
+    /// of a bad block. Transport and writer errors propagate, leaving
+    /// completed writes in `out`; the caller decides how to retain them.
+    pub fn upload_store_to(
+        &mut self,
+        part: &str,
+        total: usize,
+        out: &mut dyn Write,
+        progress: &dyn Fn(usize),
+    ) -> Result<usize> {
+        let (_, _, size) = crate::partition(part)
+            .ok_or_else(|| Error::InvalidArgument(format!("unknown partition {part:?}")))?;
+        if total > size as usize {
+            return Err(Error::InvalidArgument(format!(
+                "partition {part}: size {total:#x} exceeds {size:#x}"
+            )));
+        }
+        if total == 0 {
+            return Ok(0);
+        }
+        self.bulk_cmd(&format!("upload store {part} normal {total:#x}"))?;
+        let received = self.receive_upload_to(total, &|| false, out, progress)?;
+        if received < total {
+            log::warn!("upload store {part}: stream ended at {received:#x} of {total:#x} bytes");
+        }
+        Ok(received)
     }
 
     /// Fill memory words (AM_REQ_FILL_MEM): (addr, value) pairs.
@@ -646,4 +749,70 @@ impl<T: Transport> AmlogicSession<T> {
 fn nul_trim(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+fn poll_status(
+    mut read: impl FnMut() -> Result<String>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut pause: impl FnMut(Duration),
+) -> Result<String> {
+    loop {
+        if elapsed() >= COMMAND_TIMEOUT {
+            return Err(Error::CommandTimeout);
+        }
+        let text = read()?;
+        let spent = elapsed();
+        if spent >= COMMAND_TIMEOUT {
+            return Err(Error::CommandTimeout);
+        }
+        if text.starts_with("Continue:") {
+            log::info!("amlogic: {text} — waiting");
+            pause(CONTINUE_PAUSE.min(COMMAND_TIMEOUT - spent));
+        } else if text.starts_with("success") {
+            return Ok(text);
+        } else {
+            return Err(Error::CommandFailed(text));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn continuous_status_hits_total_deadline() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0);
+        let result = poll_status(
+            || {
+                reads.set(reads.get() + 1);
+                Ok(if elapsed.get() > Duration::from_secs(30) {
+                    "success".into()
+                } else {
+                    "Continue:34".into()
+                })
+            },
+            || elapsed.get(),
+            |delay| elapsed.set(elapsed.get() + delay),
+        );
+        assert!(matches!(result, Err(Error::CommandTimeout)));
+        assert_eq!(elapsed.get(), Duration::from_secs(30));
+        assert_eq!(reads.get(), 600);
+    }
+
+    #[test]
+    fn late_status_success_does_not_escape_deadline() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let result = poll_status(
+            || {
+                elapsed.set(Duration::from_secs(31));
+                Ok("success".into())
+            },
+            || elapsed.get(),
+            |_| unreachable!("a late reply must not trigger another pause"),
+        );
+        assert!(matches!(result, Err(Error::CommandTimeout)));
+    }
 }

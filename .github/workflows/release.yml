@@ -19,11 +19,18 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Rockchip DriverAssistant (WinUSB drivers for VID 2207 on Windows).
-  # Pinned by SHA256: an upstream change fails the build instead of
-  # shipping an unreviewed binary.
+  # Rockchip DriverAssistant: installs the vendor "Rockusb" driver that
+  # RKDevTool/upgrade_tool need. capsula-jb itself needs WinUSB instead —
+  # that is what the bundled Zadig below is for (see resources/packaging/
+  # windows-DRIVER-SETUP.txt). Both are pinned by SHA256: an upstream
+  # change fails the build instead of shipping an unreviewed binary.
   DRIVER_URL: https://dl.radxa.com/tools/windows/DriverAssitant.zip
   DRIVER_SHA256: ffc71ccf8aa40afe74b485393dc5572e431b6ecc84b13eee5360907c7ec84276
+  # Zadig 2.9 (libwdi v1.5.1): the GUI tool that rebinds a specific USB
+  # device to WinUSB. Verified against the Authenticode signature of the
+  # upstream release (CN=Akeo Consulting).
+  ZADIG_URL: https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe
+  ZADIG_SHA256: 4ecaa95df3da3621486a043aef8b3050b8bafe7c901402871e816229ef82039b
 
 jobs:
   adbd:

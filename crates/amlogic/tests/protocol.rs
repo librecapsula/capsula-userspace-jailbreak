@@ -19,12 +19,6 @@ fn bulkcmd(s: &str) -> Vec<u8> {
     v
 }
 
-fn ok_reply() -> Vec<u8> {
-    let mut r = vec![0u8; BULK_REPLY_LEN];
-    r[..7].copy_from_slice(b"success");
-    r
-}
-
 /// identify: control IN 0x20, 8 bytes requested, reply parsed to SocId.
 #[test]
 fn identify_wire_format() {
@@ -453,7 +447,10 @@ fn read_dram_one_arm() {
             req::BULKCMD,
             0,
             2,
-            bulkcmd(&format!("upload mem {:#x} normal 0x10000", amlogic::ENV_ADDR)),
+            bulkcmd(&format!(
+                "upload mem {:#x} normal 0x10000",
+                amlogic::ENV_ADDR
+            )),
         ),
         Step::BulkIn(ok),
         // 64 KiB exactly fills one device slot: a single burst
@@ -501,7 +498,10 @@ fn read_nand_range_steps() {
         req::BULKCMD,
         0,
         2,
-        bulkcmd(&format!("echo; mw.b 0x1080000 0xa5 {:#x}", amlogic::NAND_STAGE)),
+        bulkcmd(&format!(
+            "echo; mw.b 0x1080000 0xa5 {:#x}",
+            amlogic::NAND_STAGE
+        )),
     ));
     steps.push(Step::BulkIn(ok.clone()));
     steps.push(Step::ControlOut(

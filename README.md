@@ -30,14 +30,25 @@ rkdeveloptool, e2fsprogs и без root (с udev-правилами на Linux).
 
 Готовые сборки — в [Releases](../../releases): архивы под Windows
 (x64), Linux (x64/arm64) и macOS (x64/arm64). В каждом архиве —
-бинарник, README и QUICKSTART.txt; в Windows-архив дополнительно вложен
-официальный установщик USB-драйверов Rockchip.
+бинарник, README, QUICKSTART.txt и AGENTS.md; в Windows-архив
+дополнительно вложены Zadig и официальный установщик USB-драйверов
+Rockchip.
 
-- **Windows**: распакуйте архив, один раз выполните
-  `DRIVER-SETUP.txt` (установка WinUSB-драйвера для VID 2207 —
-  DriverAssistant из вложенного `RockchipUSBDriver.zip`; для Amlogic
-  мини нужен ещё драйвер на VID 1B8E, см. DRIVER-SETUP.txt), затем
-  запускайте `capsula-jb.exe`.
+- **Windows**: распакуйте архив и запускайте `capsula-jb.exe` — Windows
+  запросит права администратора (UAC) один раз, в самом начале: весь
+  инструмент работает повышенным (манифест requireAdministrator), так
+  как управляет драйверами. USB-драйверы ставятся автоматически:
+  инструмент сам устанавливает WinUSB-пакеты (сгенерированные
+  Zadig/libwdi, зашиты в бинарник) с их сертификатами в машинные
+  хранилища, сам перевязывает плату на каждом смене её USB-личины
+  (лоадер 330d, MaskROM/usbplug 330e) и сам побеждает вендорский
+  драйвер Rockusb, если тот установлен. Из обычного терминала
+  повышенный процесс получит собственное окно консоли (с паузой в
+  конце, чтобы вывод не пропал); из уже повышенного — работает в том
+  же окне. Ручной режим (Zadig из архива) и переключение обратно на
+  вендорский драйвер для RKDevTool — в `DRIVER-SETUP.txt`.
+  Для Amlogic мини (`1B8E:C003`) WinUSB пока настраивается вручную —
+  см. `DRIVER-SETUP.txt`. Автоматическая установка относится к Rockchip.
 - **macOS**: если бинарник заблокирован Gatekeeper после скачивания
   браузером — `xattr -d com.apple.quarantine capsula-jb`.
 - **Linux**: для работы без root установите udev-правила (см. Полезное).
@@ -228,6 +239,11 @@ adb shell
 - ADB по Wi-Fi: см. раздел «Подключение: USB и Wi-Fi»;
 - Linux без root: `sudo cp resources/udev/99-capsula-jailbreak.rules
   /etc/udev/rules.d/ && sudo udevadm control --reload`.
+- Инструкция для LLM-агентов по прошивке — правила подтверждения
+  записи (`--yes`), тумблер USB-драйверов WinUSB ↔ Rockusb с проверкой
+  привязки из командной строки: `AGENTS.md` в релизном архиве
+  (`resources/packaging/AGENTS.md` в репозитории). Корневой
+  `AGENTS.md` — инструкция по разработке.
 
 ## Устройство репозитория
 
@@ -246,10 +262,14 @@ crates/
   jb-core/    Домен: конфигурация, GPT, дамп (RAM-патч 0xCC),
               OTA/RKFW, оверлей userdata (ext4-lwext4), запись раздела;
               unified wait/dispatch по вендорам (target.rs).
+  win-drv/    Windows: автоматическая установка/перевязка WinUSB
+              для Rockchip (Zadig-пакеты в бинарнике, UAC).
   jb-cli/     capsula-jb — CLI.
 resources/
   config.toml Общая конфигурация: код OTA, константы RAM-патча usbplug,
               подсказки по входу в download-режимы (оба вендора).
+  drivers/    WinUSB-пакеты (INF+CAT+CER, сгенерированы Zadig/libwdi)
+              для 330D и 330E — вшиваются в бинарник крейтом win-drv.
   overlay/    adbd + флаг USB-гаджета (вшиваются в userdata).
 ```
 
@@ -261,15 +281,27 @@ resources/
 Зависимость `ext4-lwext4` компилирует C-библиотеку lwext4 через `cc`
 (нужен C-компилятор при сборке), рантайм-зависимостей нет. Лицензия
 обвязки — MIT/Apache-2.0; флаги `gpl*` самой библиотеки не
-используются.
+используются. WinUSB-пакеты в `resources/drivers/` сгенерированы
+Zadig/libwdi (LGPL, Pete Batard) — условия те же, что и для вложенного
+в архивы `zadig-2.9.exe`; см. `resources/drivers/winusb/README.md`.
 
 ## Лицензия
 
-MIT — см. [LICENSE](LICENSE). В релизные архивы вкладывается
-установщик USB-драйверов Rockchip DriverAssistant (распространяется
-как есть, по собственной лицензии вендора).
+MIT — см. [LICENSE](LICENSE). В релизные архивы вкладываются
+установщик USB-драйверов Rockchip DriverAssistant (по собственной
+лицензии вендора) и Zadig 2.9 (GPLv3, Akeo Consulting) — оба как есть.
 
 ## Разработка
+
+Amlogic: `AmlogicSession::upload_store_to` читает раздел в произвольный
+`std::io::Write` с буфером до 64 КиБ. Полученные байты сразу передаются
+писателю; при обрыве USB ранее записанный префикс остаётся у вызывающего.
+Ошибки писателя и USB различаются. Нулевой upload head означает короткий
+stream, но не доказывает bad block; для RAM требуется точный размер.
+Статусы `Continue:` ограничены общим дедлайном 30 с (уже начатая передача
+завершается по таймауту транспорта). Открытие Amlogic требует единственной
+платы на шине; BootROM определяется без burning-prime, а команды storage
+в CLI доступны только для TPL. Полный Amlogic-бекап этим API не включается.
 
 ```sh
 cargo test --workspace

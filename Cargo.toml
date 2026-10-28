@@ -6,10 +6,11 @@ members = [
     "crates/amlogic",
     "crates/jb-core",
     "crates/jb-cli",
+    "crates/win-drv",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/LibreCapsula/capsula-userspace-jailbreak"
@@ -20,6 +21,7 @@ usbcore = { path = "crates/usbcore" }
 rockusb = { path = "crates/rockusb" }
 amlogic = { path = "crates/amlogic" }
 jb-core = { path = "crates/jb-core" }
+win-drv = { path = "crates/win-drv" }
 
 # usb / protocol
 nusb = "0.2"
