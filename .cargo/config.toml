@@ -1,0 +1,15 @@
+# On Windows the main thread stack reserve comes from the PE header and
+# the MSVC linker default is only 1 MiB (Linux/macOS main threads get
+# 8 MiB). The OTA manifest query recurses deep enough that the 0.1.0
+# Windows build deterministically overflowed the stack
+# (STATUS_STACK_OVERFLOW in __rust_probestack) at "querying latest
+# firmware", while the Linux build on the same code path was fine.
+# Reserve the same 8 MiB on Windows so all platforms are equal.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+# Kept for completeness in case a GNU-target build is ever produced.
+# The GNU toolchain embeds manifests differently (windres resource), so
+# the UAC requirement would have to be added there explicitly.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

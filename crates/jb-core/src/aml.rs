@@ -1,18 +1,20 @@
-//! High-level Amlogic operations, ported from the community flasher.sh
-//! for the Capsula Mini (A113X): env capture over USB, partition dumps.
-//! Everything here is read-only.
+//! High-level read-only Amlogic operations for the Capsula Mini (A113X).
+
+pub mod backup;
 
 use crate::session::{Progress, ProgressFn};
 use amlogic::AmlogicSession;
 use std::io::Write as _;
 use std::path::Path;
 
-/// Capture the u-boot environment as text — the only way to get it
-/// without the UART: bulkcmd answers go to the serial console, so the
+/// Capture the raw text-export buffer of the u-boot environment.
+/// Bulkcmd answers go to the serial console, so the
 /// env is exported into DRAM and the DRAM is read back over USB
 /// (flasher.sh `capture_env`). The buffer is zeroed first, or the tail
 /// would carry the 0x55 wall of the BL2 memory test.
-pub fn capture_env<T: usbcore::Transport>(s: &mut AmlogicSession<T>) -> anyhow::Result<String> {
+pub fn capture_env_raw<T: usbcore::Transport>(
+    s: &mut AmlogicSession<T>,
+) -> anyhow::Result<Vec<u8>> {
     s.bulk_cmd(&format!(
         "echo; mw.b {:#x} 0 {:#x}",
         amlogic::ENV_ADDR,
@@ -24,16 +26,20 @@ pub fn capture_env<T: usbcore::Transport>(s: &mut AmlogicSession<T>) -> anyhow::
     let buf = s
         .read_dram(amlogic::ENV_ADDR, amlogic::ENV_SIZE, &|_| {})
         .map_err(|e| anyhow::anyhow!("read env from DRAM: {e}"))?;
-    let end = buf.iter().position(|&b| b == 0).ok_or_else(|| {
-        anyhow::anyhow!(
-            "env text is not NUL-terminated within {:#x} bytes",
-            amlogic::ENV_SIZE
-        )
-    })?;
-    let text = String::from_utf8_lossy(&buf[..end]).into_owned();
-    // trim the 0x55 wall too, in case mw.b was rejected
-    let text = text.trim_matches('\u{55}').trim_end();
-    Ok(text.to_string())
+    Ok(buf)
+}
+
+/// Decode the environment snapshot as text.
+pub fn capture_env<T: usbcore::Transport>(s: &mut AmlogicSession<T>) -> anyhow::Result<String> {
+    let buf = capture_env_raw(s)?;
+    let end = buf
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| anyhow::anyhow!("env text is not NUL-terminated"))?;
+    Ok(String::from_utf8_lossy(&buf[..end])
+        .trim_matches('\u{55}')
+        .trim_end()
+        .to_string())
 }
 
 /// Incremental partition dump state: survives session reconnects (the
@@ -44,8 +50,10 @@ pub struct DumpState {
     pub off: u32,
     pub size: usize,
     pub data: Vec<u8>,
-    /// Set when a `nand read` failed mid-partition: the received prefix
-    /// is the truth (bad blocks; flasher.sh `readable_size`).
+    /// Set when the range reader returns fewer bytes than requested.
+    /// A `failed:` status with a changed staging buffer does not imply a
+    /// known shorter length: all uploaded bytes are preserved and the
+    /// uncertain NAND completeness is logged by the range reader.
     pub short_read: bool,
 }
 

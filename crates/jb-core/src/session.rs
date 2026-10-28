@@ -16,6 +16,18 @@ use std::time::Duration;
 pub enum Progress {
     /// A protocol line (the "==> ..." of the bash v1).
     Step(String),
+    TransferStart {
+        name: String,
+        bytes: u64,
+    },
+    TransferProgress {
+        name: String,
+        done: u64,
+        total: u64,
+    },
+    TransferDone {
+        name: String,
+    },
     PartitionStart {
         name: String,
         sectors: u64,

@@ -21,3 +21,10 @@ clap = { workspace = true }
 indicatif = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# WinUSB driver management (Zadig-generated packages); no-op stubs on
+# non-Windows, so it is an unconditional dependency
+win-drv = { workspace = true }
+
+[build-dependencies]
+# embeds capsula-jb.manifest (requireAdministrator) into the exe
+embed-resource = "3"

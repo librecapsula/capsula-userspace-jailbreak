@@ -69,10 +69,36 @@ impl SocId {
         }
     }
 
-    /// Whether the BootROM demands a password before accepting commands
-    /// (only meaningful when the reply carries the extra bytes).
+    /// Whether the reply's optional bytes are valid: the spec gates
+    /// PWD_REQ/PWD_OK/MAP on a nonzero V3 (our `stage_minor`).
+    pub fn has_optional_fields(&self) -> bool {
+        self.stage_minor != 0
+    }
+
+    /// `PWD_REQ` (byte 4): the device demands a password before accepting
+    /// commands. `None` when the reply is too short or V3 is zero.
     pub fn need_password(&self) -> Option<bool> {
-        self.extra.first().map(|&b| b != 0)
+        if !self.has_optional_fields() {
+            return None;
+        }
+        self.extra.first().map(|&byte| byte != 0)
+    }
+
+    /// `PWD_OK` (byte 5): the password was accepted. `None` when the
+    /// reply is too short or V3 is zero.
+    pub fn password_ok(&self) -> Option<bool> {
+        if !self.has_optional_fields() {
+            return None;
+        }
+        self.extra.get(1).map(|&byte| byte != 0)
+    }
+
+    /// `MAP6`/`MAP7` (bytes 6 and 7); byte 7 also signals their presence.
+    pub fn page_map(&self) -> Option<[u8; 2]> {
+        if !self.has_optional_fields() || self.extra.len() < 4 || self.extra[3] == 0 {
+            return None;
+        }
+        Some([self.extra[2], self.extra[3]])
     }
 
     /// Version string like `0-9-0-0` (major-minor-stage_major-stage_minor).
@@ -112,9 +138,18 @@ mod tests {
         // 4-byte reply: no password info
         let id = SocId::parse(&[0, 0, 0, 0]).unwrap();
         assert_eq!(id.need_password(), None);
-        // locked BootROM: need_password=1, password_ok=0
-        let id = SocId::parse(&[0, 0, 0, 0, 1, 0]).unwrap();
+        // V3 == 0 masks bytes 4..7 even when they are nonzero
+        let id = SocId::parse(&[0, 7, 0, 0, 1, 0]).unwrap();
+        assert_eq!(id.need_password(), None);
+        // locked BootROM (V3 != 0): need_password=1, password_ok=0
+        let id = SocId::parse(&[0, 7, 0, 16, 1, 0]).unwrap();
         assert_eq!(id.need_password(), Some(true));
+        assert_eq!(id.password_ok(), Some(false));
+        // MAP6/MAP7 are present when byte 7 is nonzero
+        let id = SocId::parse(&[0, 7, 0, 16, 0, 1, 2, 3]).unwrap();
+        assert_eq!(id.page_map(), Some([2, 3]));
+        let id = SocId::parse(&[0, 7, 0, 16, 0, 1, 2, 0]).unwrap();
+        assert_eq!(id.page_map(), None);
         assert!(SocId::parse(&[0, 0, 0]).is_none());
     }
 }

@@ -155,9 +155,227 @@ pub fn append_sha256_line(dir: &Path, file_name: &str, hex: &str) -> std::io::Re
     writeln!(f, "{hex}  {file_name}")
 }
 
+/// A new capture owns its directory; it never reopens an older backup
+/// for writing. Shared file operations, independent of GPT or NAND.
+pub(crate) struct CaptureDirectory {
+    path: PathBuf,
+}
+
+impl CaptureDirectory {
+    pub(crate) fn create(parent: &Path, prefix: &str) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        safe_capture_name(prefix)?;
+        std::fs::create_dir_all(parent)?;
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for _ in 0..64 {
+            let path = parent.join(format!(
+                "{prefix}-{time}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "cannot allocate capture directory",
+        ))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(crate) fn create_file(&self, name: &str) -> std::io::Result<std::fs::File> {
+        safe_capture_name(name)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(self.path.join(name))
+    }
+    pub(crate) fn write_file(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.require_absent(name)?;
+        let partial = format!("{name}.partial");
+        let mut file = self.create_file(&partial)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        self.publish_partial(&partial, name)
+    }
+    pub(crate) fn replace_file(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        safe_capture_name(name)?;
+        let temp = format!(".{name}.tmp");
+        let mut file = self.create_file(&temp)?;
+        let result = (|| {
+            file.write_all(data)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(self.path.join(&temp), self.path.join(name))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(self.path.join(&temp));
+        }
+        result
+    }
+    pub(crate) fn publish_partial(&self, partial: &str, name: &str) -> std::io::Result<()> {
+        safe_capture_name(partial)?;
+        self.require_absent(name)?;
+        if !std::fs::symlink_metadata(self.path.join(partial))?
+            .file_type()
+            .is_file()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "capture source is not a regular file",
+            ));
+        }
+        std::fs::rename(self.path.join(partial), self.path.join(name))
+    }
+
+    fn require_absent(&self, name: &str) -> std::io::Result<()> {
+        safe_capture_name(name)?;
+        match std::fs::symlink_metadata(self.path.join(name)) {
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "capture file already exists",
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+pub(crate) fn safe_capture_name(name: &str) -> std::io::Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid capture filename",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CaptureParent(PathBuf);
+    impl CaptureParent {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!("jb-capture-{}-{nonce}", std::process::id())))
+        }
+    }
+    impl Drop for CaptureParent {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn capture_directories_and_files_are_exclusive() {
+        let parent = CaptureParent::new();
+        let first = CaptureDirectory::create(&parent.0, "amlogic").unwrap();
+        let second = CaptureDirectory::create(&parent.0, "amlogic").unwrap();
+        assert_ne!(first.path(), second.path());
+        first.write_file("boot.bin", b"old").unwrap();
+        assert!(first.write_file("boot.bin", b"new").is_err());
+        assert_eq!(
+            std::fs::read(first.path().join("boot.bin")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn capture_manifest_replace_is_atomic_and_reusable() {
+        let parent = CaptureParent::new();
+        let capture = CaptureDirectory::create(&parent.0, "amlogic").unwrap();
+        capture.replace_file("manifest.json", b"running").unwrap();
+        capture.replace_file("manifest.json", b"failed").unwrap();
+        assert_eq!(
+            std::fs::read(capture.path().join("manifest.json")).unwrap(),
+            b"failed"
+        );
+        assert_eq!(std::fs::read_dir(capture.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn capture_filenames_cannot_escape_directory() {
+        let parent = CaptureParent::new();
+        let capture = CaptureDirectory::create(&parent.0, "amlogic").unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "/absolute",
+            "nested/file",
+            "windows\\file",
+        ] {
+            assert_eq!(
+                capture.create_file(name).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(std::fs::read_dir(capture.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn capture_partial_publish_never_clobbers_existing_file() {
+        use std::io::Write;
+        let parent = CaptureParent::new();
+        let capture = CaptureDirectory::create(&parent.0, "amlogic").unwrap();
+        capture.write_file("boot.bin", b"old").unwrap();
+        let mut file = capture.create_file("boot.bin.partial").unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+        assert!(capture
+            .publish_partial("boot.bin.partial", "boot.bin")
+            .is_err());
+        assert_eq!(
+            std::fs::read(capture.path().join("boot.bin")).unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            std::fs::read(capture.path().join("boot.bin.partial")).unwrap(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn capture_failed_manifest_replace_cleans_only_its_temp_file() {
+        let parent = CaptureParent::new();
+        let capture = CaptureDirectory::create(&parent.0, "amlogic").unwrap();
+        std::fs::create_dir(capture.path().join("manifest.json")).unwrap();
+        assert!(capture.replace_file("manifest.json", b"complete").is_err());
+        assert!(capture.path().join("manifest.json").is_dir());
+        assert!(!capture.path().join(".manifest.json.tmp").exists());
+    }
 
     #[test]
     fn sanitize_matches_legacy() {

@@ -21,6 +21,18 @@ impl CliProgress {
                 self.finish_bar();
                 println!("{msg}");
             }
+            Progress::TransferStart { name, bytes } => {
+                self.finish_bar();
+                let pb = ProgressBar::new(bytes);
+                pb.set_style(
+                    ProgressStyle::with_template(
+                        "{msg} [{elapsed_precise}] {bar:30.cyan/blue} {bytes}/{total_bytes}",
+                    )
+                    .unwrap(),
+                );
+                pb.set_message(name);
+                *self.bar.borrow_mut() = Some(pb);
+            }
             Progress::PartitionStart { name, sectors } => {
                 self.finish_bar();
                 let pb = ProgressBar::new(sectors);
@@ -33,12 +45,13 @@ impl CliProgress {
                 pb.set_message(name);
                 *self.bar.borrow_mut() = Some(pb);
             }
-            Progress::PartitionProgress { done, total, .. } => {
+            Progress::PartitionProgress { done, total, .. }
+            | Progress::TransferProgress { done, total, .. } => {
                 if let Some(b) = self.bar.borrow().as_ref() {
                     b.set_position(done.min(total));
                 }
             }
-            Progress::PartitionDone { .. } => {
+            Progress::PartitionDone { .. } | Progress::TransferDone { .. } => {
                 self.finish_bar();
             }
         }

@@ -4,7 +4,8 @@
 
 use amlogic::req;
 use amlogic::session::{BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK};
-use amlogic::{soc::Stage, AmlogicSession, SocId};
+use amlogic::{soc::Stage, AmlogicSession, Error, SocId};
+use std::time::Duration;
 use usbcore::mock::{MockTransport, Step};
 
 fn session(steps: Vec<Step>) -> AmlogicSession<MockTransport> {
@@ -17,12 +18,6 @@ fn bulkcmd(s: &str) -> Vec<u8> {
     let mut v = vec![0u8; 64];
     v[..s.len()].copy_from_slice(s.as_bytes());
     v
-}
-
-fn ok_reply() -> Vec<u8> {
-    let mut r = vec![0u8; BULK_REPLY_LEN];
-    r[..7].copy_from_slice(b"success");
-    r
 }
 
 /// identify: control IN 0x20, 8 bytes requested, reply parsed to SocId.
@@ -117,27 +112,25 @@ fn run_wire_format() {
 /// 16-byte head [addr, len], then the payload on bulk OUT.
 #[test]
 fn write_large_memory_wire_format() {
-    let mut s = session(vec![
-        Step::ControlOut(req::WR_LARGE_MEM, 0x0200, 3, {
-            let mut h = [0u8; 16];
-            h[0..4].copy_from_slice(&0x01000000u32.to_le_bytes());
-            h[4..8].copy_from_slice(&0x0600u32.to_le_bytes());
-            h.to_vec()
-        }),
-        Step::BulkOut((0u32..0x200).map(|b| b as u8).collect()),
-        Step::BulkOut((0x200u32..0x400).map(|b| b as u8).collect()),
-        Step::BulkOut({
-            // the tail chunk is zero-padded to a whole block
-            let mut c = vec![0u8; 0x200];
-            c[0] = 0x55;
-            c
-        }),
-    ]);
     let data: Vec<u8> = (0u32..0x200)
         .chain(0x200u32..0x400)
         .map(|b| b as u8)
         .chain([0x55])
         .collect();
+    let mut s = session(vec![
+        Step::ControlOut(req::WR_LARGE_MEM, 0x0200, 3, {
+            let mut h = [0u8; 16];
+            h[0..4].copy_from_slice(&0x01000000u32.to_le_bytes());
+            h[4..8].copy_from_slice(&0x0401u32.to_le_bytes());
+            h[8..12].copy_from_slice(&(amlogic::add_sum(&data) & 0xffff).to_le_bytes());
+            h[12..16].copy_from_slice(&0x0200u32.to_le_bytes());
+            h.to_vec()
+        }),
+        Step::BulkOut(data[..0x200].to_vec()),
+        Step::BulkOut(data[0x200..0x400].to_vec()),
+        // the final block MAY be shorter (§13.3); no zero padding
+        Step::BulkOut(vec![0x55]),
+    ]);
     s.write_large_memory(0x01000000, &data, 0x200).unwrap();
     assert_eq!(s.transport().pos, 4);
 }
@@ -150,6 +143,7 @@ fn read_large_memory_wire_format() {
             let mut h = [0u8; 16];
             h[0..4].copy_from_slice(&0xd9000000u32.to_le_bytes());
             h[4..8].copy_from_slice(&0x0400u32.to_le_bytes());
+            h[12..16].copy_from_slice(&0x0200u32.to_le_bytes());
             h.to_vec()
         }),
         Step::BulkIn(vec![0x11; 0x200]),
@@ -159,6 +153,29 @@ fn read_large_memory_wire_format() {
     s.read_large_memory(0xd9000000, &mut buf, 0x200).unwrap();
     assert_eq!(&buf[..0x200], &vec![0x11; 0x200][..]);
     assert_eq!(&buf[0x200..], &vec![0x22; 0x200][..]);
+}
+
+/// §13.2: the length need not be a multiple of the block size; the last
+/// block is short.
+#[test]
+fn read_large_memory_accepts_a_short_final_block() {
+    let mut s = session(vec![
+        Step::ControlOut(req::RD_LARGE_MEM, 0x0200, 3, {
+            let mut h = [0u8; 16];
+            h[0..4].copy_from_slice(&0xd9000000u32.to_le_bytes());
+            h[4..8].copy_from_slice(&0x0401u32.to_le_bytes());
+            h[12..16].copy_from_slice(&0x0200u32.to_le_bytes());
+            h.to_vec()
+        }),
+        Step::BulkIn(vec![0x33; 0x200]),
+        Step::BulkIn(vec![0x44; 0x200]),
+        Step::BulkIn(vec![0x55]),
+    ]);
+    let mut buf = vec![0u8; 0x401];
+    s.read_large_memory(0xd9000000, &mut buf, 0x200).unwrap();
+    assert_eq!(&buf[..0x200], &vec![0x33; 0x200][..]);
+    assert_eq!(&buf[0x200..0x400], &vec![0x44; 0x200][..]);
+    assert_eq!(buf[0x400], 0x55);
 }
 
 /// bulkcmd: NUL-terminated string in the EP0 stage (wValue=0, wIndex=2),
@@ -201,53 +218,68 @@ fn bulk_cmd_too_long_rejected_before_the_bus() {
     assert_eq!(s.transport().pos, 0); // nothing was sent
 }
 
-/// Media write (download packet): 32-byte head (retry, len, seq, add_sum,
-/// alg 0x00ef, ack len 0x200), payload on bulk OUT, `OK!!` ack on bulk IN.
+/// Media write (download packet): 32-byte head with the spec §16.2
+/// layout — attempt, length, seq << 4, add_sum, `ef 00 00 01`, zeros.
+fn media_head(data: &[u8], seq: u32, attempt: u32) -> Vec<u8> {
+    let mut head = [0u8; 0x20];
+    head[0..4].copy_from_slice(&attempt.to_le_bytes());
+    head[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    head[8..12].copy_from_slice(&(seq << 4).to_le_bytes());
+    head[12..16].copy_from_slice(&amlogic::add_sum(data).to_le_bytes());
+    head[16..20].copy_from_slice(&0x0100_00efu32.to_le_bytes());
+    head.to_vec()
+}
+
+fn media_ack(text: &str) -> Vec<u8> {
+    let mut reply = vec![0u8; MEDIA_ACK_LEN];
+    reply[..text.len()].copy_from_slice(text.as_bytes());
+    reply
+}
+
 #[test]
 fn write_media_wire_format() {
     let data = vec![0x42u8; 512];
-    let sum = amlogic::add_sum(&data);
-    let mut head = [0u8; 0x20];
-    head[4..8].copy_from_slice(&512u32.to_le_bytes());
-    head[8..12].copy_from_slice(&7u32.to_le_bytes());
-    head[12..16].copy_from_slice(&sum.to_le_bytes());
-    head[16..18].copy_from_slice(&0x00efu16.to_le_bytes());
-    head[18..20].copy_from_slice(&(MEDIA_ACK_LEN as u16).to_le_bytes());
-
     let mut s = session(vec![
-        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, head.to_vec()),
+        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, media_head(&data, 7, 0)),
         Step::BulkOut(data.clone()),
-        Step::BulkIn({
-            let mut r = vec![0u8; MEDIA_ACK_LEN];
-            r[..4].copy_from_slice(b"OK!!");
-            r
-        }),
+        Step::BulkIn(media_ack("OK!!")),
     ]);
     s.write_media(&data, 7).unwrap();
     assert_eq!(s.transport().pos, 3);
 }
 
+/// A rejected block is retried with the attempt counter advanced, as
+/// the spec §16.2 requires (up to three attempts).
 #[test]
-fn write_media_rejects_error_ack() {
+fn write_media_retries_a_rejected_block() {
     let data = vec![1u8; 16];
-    let sum = amlogic::add_sum(&data);
-    let mut head = [0u8; 0x20];
-    head[4..8].copy_from_slice(&16u32.to_le_bytes());
-    head[12..16].copy_from_slice(&sum.to_le_bytes());
-    head[16..18].copy_from_slice(&0x00efu16.to_le_bytes());
-    head[18..20].copy_from_slice(&(MEDIA_ACK_LEN as u16).to_le_bytes());
-
     let mut s = session(vec![
-        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, head.to_vec()),
-        Step::BulkOut(data),
-        Step::BulkIn({
-            let mut r = vec![0u8; MEDIA_ACK_LEN];
-            r[..15].copy_from_slice(b"0x: genSum 5 !=");
-            r
-        }),
+        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, media_head(&data, 0, 0)),
+        Step::BulkOut(data.clone()),
+        Step::BulkIn(media_ack("0x: genSum 5 !=")),
+        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, media_head(&data, 0, 1)),
+        Step::BulkOut(data.clone()),
+        Step::BulkIn(media_ack("OK!!")),
     ]);
-    let err = s.write_media(&[1u8; 16], 0).unwrap_err();
+    s.write_media(&data, 0).unwrap();
+    assert_eq!(s.transport().pos, 6);
+}
+
+#[test]
+fn write_media_rejects_after_three_attempts() {
+    let data = vec![1u8; 16];
+    let mut steps = Vec::new();
+    for attempt in 0..3 {
+        steps.extend([
+            Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, media_head(&data, 0, attempt)),
+            Step::BulkOut(data.clone()),
+            Step::BulkIn(media_ack("0x: genSum 5 !=")),
+        ]);
+    }
+    let mut s = session(steps);
+    let err = s.write_media(&data, 0).unwrap_err();
     assert!(err.to_string().contains("genSum"));
+    assert_eq!(s.transport().pos, 9);
 }
 
 /// Media streaming chunks a large buffer into MEDIA_CHUNK packets.
@@ -256,20 +288,14 @@ fn write_media_all_chunks() {
     let data = vec![0x77u8; MEDIA_CHUNK + 128];
     let mut steps = vec![];
     for (seq, part) in [(0u32, &data[..MEDIA_CHUNK]), (1u32, &data[MEDIA_CHUNK..])] {
-        let sum = amlogic::add_sum(part);
-        let mut head = [0u8; 0x20];
-        head[4..8].copy_from_slice(&(part.len() as u32).to_le_bytes());
-        head[8..12].copy_from_slice(&seq.to_le_bytes());
-        head[12..16].copy_from_slice(&sum.to_le_bytes());
-        head[16..18].copy_from_slice(&0x00efu16.to_le_bytes());
-        head[18..20].copy_from_slice(&(MEDIA_ACK_LEN as u16).to_le_bytes());
-        steps.push(Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, head.to_vec()));
+        steps.push(Step::ControlOut(
+            req::WRITE_MEDIA,
+            1,
+            0xffff,
+            media_head(part, seq, 0),
+        ));
         steps.push(Step::BulkOut(part.to_vec()));
-        steps.push(Step::BulkIn({
-            let mut r = vec![0u8; MEDIA_ACK_LEN];
-            r[..4].copy_from_slice(b"OK!!");
-            r
-        }));
+        steps.push(Step::BulkIn(media_ack("OK!!")));
     }
     let mut s = session(steps);
     s.write_media_all(&data).unwrap();
@@ -453,7 +479,10 @@ fn read_dram_one_arm() {
             req::BULKCMD,
             0,
             2,
-            bulkcmd(&format!("upload mem {:#x} normal 0x10000", amlogic::ENV_ADDR)),
+            bulkcmd(&format!(
+                "upload mem {:#x} normal 0x10000",
+                amlogic::ENV_ADDR
+            )),
         ),
         Step::BulkIn(ok),
         // 64 KiB exactly fills one device slot: a single burst
@@ -501,7 +530,10 @@ fn read_nand_range_steps() {
         req::BULKCMD,
         0,
         2,
-        bulkcmd(&format!("echo; mw.b 0x1080000 0xa5 {:#x}", amlogic::NAND_STAGE)),
+        bulkcmd(&format!(
+            "echo; mw.b 0x1080000 0xa5 {:#x}",
+            amlogic::NAND_STAGE
+        )),
     ));
     steps.push(Step::BulkIn(ok.clone()));
     steps.push(Step::ControlOut(
@@ -561,4 +593,127 @@ fn bulk_cmd_short_reply_accepted() {
     ]);
     let status = s.bulk_cmd("low_power").unwrap();
     assert_eq!(status, "success");
+}
+
+/// The spec assigns a per-request deadline: identify 5 s, run and
+/// burning commands 50 s, TPL status 60 s.
+#[test]
+fn identify_uses_the_five_second_deadline() {
+    let mut s = session(vec![Step::ControlIn(
+        req::IDENTIFY_HOST,
+        0,
+        0,
+        vec![0, 7, 0, 16],
+    )]);
+    s.identify().unwrap();
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn run_uses_the_fifty_second_deadline() {
+    let addr = 0x0100_8000u32;
+    let mut s = session(vec![Step::ControlOut(
+        req::RUN_IN_ADDR,
+        (addr >> 16) as u16,
+        addr as u16,
+        addr.to_le_bytes().to_vec(),
+    )]);
+    s.run(addr, false).unwrap();
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(50)));
+}
+
+#[test]
+fn bulk_command_uses_the_fifty_second_deadline() {
+    let mut s = session(vec![
+        Step::ControlOut(req::BULKCMD, 0, 2, bulkcmd("echo")),
+        Step::BulkIn(b"success\0".to_vec()),
+    ]);
+    s.bulk_cmd("echo").unwrap();
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(50)));
+}
+
+#[test]
+fn tpl_status_uses_the_sixty_second_deadline() {
+    let mut s = session(vec![Step::ControlIn(
+        req::TPL_STAT,
+        0,
+        0,
+        b"success\0".to_vec(),
+    )]);
+    s.tpl_stat().unwrap();
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(60)));
+}
+
+/// The prime must notice a dead bulk pipe quickly instead of burning
+/// the 50 s command window eight times.
+#[test]
+fn prime_uses_the_short_pipe_deadline() {
+    let mut s = session(vec![
+        Step::ControlOut(req::BULKCMD, 0, 2, bulkcmd("echo")),
+        Step::BulkIn(b"success\0".to_vec()),
+    ]);
+    s.prime().unwrap();
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(5)));
+}
+
+/// Password: wValue is the 16-bit sum of the bytes, wIndex 0, and the
+/// data phase carries the plaintext bytes (spec §10).
+#[test]
+fn password_wire_format() {
+    let password = b"secret";
+    let sum: u16 = password
+        .iter()
+        .fold(0u16, |sum, &byte| sum.wrapping_add(byte as u16));
+    let mut s = session(vec![Step::ControlOut(
+        req::PASSWORD,
+        sum,
+        0,
+        password.to_vec(),
+    )]);
+    s.send_password(password).unwrap();
+    assert_eq!(s.transport().pos, 1);
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(8)));
+}
+
+#[test]
+fn password_length_is_checked_before_usb() {
+    let mut s = session(vec![]);
+    assert!(s.send_password(&[]).is_err());
+    assert!(s.send_password(&[0u8; 65]).is_err());
+    assert_eq!(s.transport().pos, 0);
+}
+
+/// A TPL that still reports PWD_REQ=1 must not be sent the prime
+/// command; the caller needs to authenticate first.
+#[test]
+fn identify_and_prime_refuses_a_locked_tpl() {
+    let mut s = session(vec![Step::ControlIn(
+        req::IDENTIFY_HOST,
+        0,
+        0,
+        vec![0, 7, 0, 16, 1, 0, 0, 0],
+    )]);
+    assert!(matches!(
+        s.identify_and_prime(),
+        Err(Error::PasswordRequired)
+    ));
+    assert_eq!(s.transport().pos, 1);
+}
+
+/// PWD_REQ=1 with PWD_OK=1 is an already-authenticated session.
+#[test]
+fn identify_and_prime_accepts_an_authenticated_tpl() {
+    let mut steps = vec![Step::ControlIn(
+        req::IDENTIFY_HOST,
+        0,
+        0,
+        vec![0, 7, 0, 16, 1, 1, 0, 0],
+    )];
+    steps.extend([
+        Step::ControlOut(req::BULKCMD, 0, 2, bulkcmd("echo")),
+        Step::BulkIn(b"success\0".to_vec()),
+    ]);
+    let mut s = session(steps);
+    assert_eq!(s.identify_and_prime().unwrap().stage(), Stage::Tpl);
+    assert_eq!(s.transport().pos, 3);
 }
