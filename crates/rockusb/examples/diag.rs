@@ -1,7 +1,7 @@
 //! diag — live device diagnostics in loader mode (debug only):
 //! ready/chip_info/flash_detect and a reset, with full error output.
 
-use rockusb::loader::{opcode, LoaderSession};
+use rockusb::loader::LoaderSession;
 use rockusb::{DeviceMode, NusbTransport};
 
 fn main() {
@@ -53,7 +53,6 @@ fn main() {
         "reset(maskrom): {:?}",
         s.reset(rockusb::loader::RESET_SUBCODE_MASKROM)
     );
-    let _ = opcode::RESET_DEVICE;
     std::thread::sleep(std::time::Duration::from_secs(2));
     println!("mode after 2s: {:?}", rockusb::current_mode());
 }

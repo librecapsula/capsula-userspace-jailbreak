@@ -134,7 +134,7 @@ impl Bus for UsbBus {
 /// Does this USB serial identify the column? Gadget fallbacks report
 /// empty or all-zero strings (the BootROM gadget: "000000000") — those
 /// must never become a backup cache key.
-pub fn is_identifying(serial: &str) -> bool {
+fn is_identifying(serial: &str) -> bool {
     !serial.is_empty() && serial.chars().any(|c| c != '0')
 }
 
@@ -319,7 +319,7 @@ pub fn bring_up<B: Bus>(
 
 /// Open and sanity-check the stock rockusb loader of a first-generation
 /// column (330d with a gift serial).
-pub fn attach_stock_loader<B: Bus>(
+fn attach_stock_loader<B: Bus>(
     bus: &mut B,
     progress: ProgressFn,
 ) -> rockusb::Result<LoaderSession<B::T>> {
@@ -338,7 +338,7 @@ pub fn attach_stock_loader<B: Bus>(
 
 /// Verify the usbplug signatures in DRAM: proof that our loader build is
 /// running, whose RAM-patch address is known.
-pub fn verify_usbplug_signatures<T: Transport>(
+fn verify_usbplug_signatures<T: Transport>(
     s: &mut LoaderSession<T>,
     config: &Config,
     progress: ProgressFn,

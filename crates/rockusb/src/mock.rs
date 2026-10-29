@@ -19,17 +19,11 @@ pub enum Step {
 pub struct MockTransport {
     pub steps: Vec<Step>,
     pub pos: usize,
-    /// Log of every call, for test assertions.
-    pub log: Vec<String>,
 }
 
 impl MockTransport {
     pub fn new(steps: Vec<Step>) -> Self {
-        MockTransport {
-            steps,
-            pos: 0,
-            log: Vec::new(),
-        }
+        MockTransport { steps, pos: 0 }
     }
 
     fn next(&mut self, what: &str) -> Result<Step> {
@@ -52,8 +46,6 @@ impl Transport for MockTransport {
                         hex::encode(&expect),
                     )));
                 }
-                self.log
-                    .push(format!("ctrl {r:#x}/{index:#x} {}b", data.len()));
                 Ok(())
             }
             other => Err(Error::Usb(format!(
@@ -62,7 +54,7 @@ impl Transport for MockTransport {
         }
     }
 
-    fn bulk_write(&mut self, endpoint: u8, data: &[u8]) -> Result<()> {
+    fn bulk_write(&mut self, _endpoint: u8, data: &[u8]) -> Result<()> {
         match self.next("bulk_write")? {
             Step::BulkOut(expect) => {
                 if expect != data {
@@ -71,8 +63,6 @@ impl Transport for MockTransport {
                         hex::encode(expect),
                     )));
                 }
-                self.log
-                    .push(format!("out ep{endpoint:#x} {}b", data.len()));
                 Ok(())
             }
             other => Err(Error::Usb(format!(
@@ -81,7 +71,7 @@ impl Transport for MockTransport {
         }
     }
 
-    fn bulk_read(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<()> {
+    fn bulk_read(&mut self, _endpoint: u8, buf: &mut [u8]) -> Result<()> {
         let mut filled = 0;
         while filled < buf.len() {
             match self.next("bulk_read")? {
@@ -95,7 +85,6 @@ impl Transport for MockTransport {
                 other => return Err(Error::Usb(format!("mock: expected data, got {other:?}"))),
             }
         }
-        self.log.push(format!("in ep{endpoint:#x} {}b", buf.len()));
         Ok(())
     }
 }

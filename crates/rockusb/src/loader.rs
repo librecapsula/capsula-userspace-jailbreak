@@ -24,7 +24,6 @@ pub mod opcode {
     pub const EXEC_SDRAM: u8 = 0x19;
     pub const READ_FLASH_INFO: u8 = 0x1a;
     pub const READ_CHIP_INFO: u8 = 0x1b;
-    pub const ERASE_LBA: u8 = 0x25;
     pub const READ_CAPABILITY: u8 = 0xaa;
     pub const RESET_DEVICE: u8 = 0xff;
 }
@@ -47,7 +46,6 @@ pub struct FlashInfo {
     pub block_size: u16,
     pub page_size: u8,
     pub ecc_bits: u8,
-    pub access_time: u8,
     pub manufacturer_id: u8,
     pub chip_select: u8,
     pub id: [u8; 5],
@@ -242,7 +240,6 @@ impl<T: Transport> LoaderSession<T> {
             block_size: u16::from_le_bytes([buf[4], buf[5]]),
             page_size: buf[6],
             ecc_bits: buf[7],
-            access_time: buf[8],
             manufacturer_id: buf[9],
             chip_select: buf[10],
             id,
@@ -312,31 +309,6 @@ impl<T: Transport> LoaderSession<T> {
                 None,
             )?;
             off += n;
-        }
-        Ok(())
-    }
-
-    /// Erase an LBA range (ERASE_LBA), chunked. **Destructive.**
-    pub fn erase_lba(&mut self, sector: u32, count: u32) -> Result<()> {
-        let mut sec = sector;
-        let mut cnt = count;
-        while cnt > 0 {
-            let n = cnt.min(LBA_CHUNK);
-            self.exec(
-                &RawCommand {
-                    opcode: opcode::ERASE_LBA,
-                    subcode: 0,
-                    address: sec,
-                    size: n as u16,
-                    cmdlen: 10,
-                    length: 0,
-                    flag_in: false,
-                },
-                None,
-                None,
-            )?;
-            sec += n;
-            cnt -= n;
         }
         Ok(())
     }

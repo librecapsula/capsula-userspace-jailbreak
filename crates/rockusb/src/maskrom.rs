@@ -1,7 +1,7 @@
 //! MaskROM stage (BootROM, 2207:330e without iProduct): the DownloadBoot
 //! protocol. Port of rock_maskrom_upload_memory / download from xrock.
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::loader_container::LoaderContainer;
 use crate::transport::Transport;
 use crate::util::{crc16_xrock, Rc4};
@@ -74,12 +74,5 @@ impl<T: Transport> MaskRomSession<T> {
             }
         }
         Ok(())
-    }
-
-    /// Load a container from a file and run download.
-    pub fn download_file(&mut self, path: &std::path::Path) -> Result<()> {
-        let container = LoaderContainer::parse_file(path)
-            .map_err(|e| Error::Loader(format!("{}: {e}", path.display())))?;
-        self.download(&container)
     }
 }

@@ -371,7 +371,6 @@ fn backup_fails_on_cc_mask() {
     let err = backup(&mut s, &test_config(), &out, &|_| {}).expect_err("the mask must be caught");
     assert!(err.to_string().contains("0xCC"), "{err}");
     let _ = std::fs::remove_dir_all(&out);
-    let _ = CHUNK_SECTORS;
 }
 
 /// The partition write is chunked with progress events per chunk (the

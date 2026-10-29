@@ -135,7 +135,7 @@ impl NusbTransport {
     }
 
     /// Open an exact DeviceInfo (to pick a specific instance).
-    pub fn open_device_info(info: &nusb::DeviceInfo) -> Result<Self> {
+    fn open_device_info(info: &nusb::DeviceInfo) -> Result<Self> {
         let device = info.open().wait()?;
         let interface = match device.claim_interface(0).wait() {
             Ok(i) => i,

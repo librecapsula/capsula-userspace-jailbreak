@@ -54,7 +54,6 @@ pub struct LoaderContainer {
     pub is_rc4on: bool,
     pub is_signed: bool,
     pub chiptype: u32,
-    pub version: u32,
     pub entries: Vec<Entry>,
 }
 
@@ -94,7 +93,6 @@ impl LoaderContainer {
         let is_rc4on = rc4_flag == 0;
         let is_signed = data[43] == b'S';
 
-        let version = u32le(&data, 6);
         let chiptype = u32le(&data, 21);
         let n471 = data[25] as usize;
         let n472 = data[31] as usize;
@@ -167,14 +165,8 @@ impl LoaderContainer {
             is_rc4on,
             is_signed,
             chiptype,
-            version,
             entries,
         })
-    }
-
-    pub fn parse_file(path: &std::path::Path) -> Result<Self> {
-        let data = std::fs::read(path).map_err(Error::Io)?;
-        Self::parse(data)
     }
 
     /// Stages for the MaskROM `download`, in entry order:

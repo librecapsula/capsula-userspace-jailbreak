@@ -20,7 +20,7 @@
 //!
 //! On other platforms everything is a no-op.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A Zadig/libwdi-generated WinUSB driver package for one hardware ID.
 pub struct Package {
@@ -83,7 +83,7 @@ pub use stub::{fix_cwd_if_system32, pause_if_own_console, Session};
 /// Does this error message look like "the devnode is bound to a wrong
 /// driver"? nusb reports a non-WinUSB binding as "incompatible driver
 /// is installed for the device"; match loosely to survive rewording.
-pub fn is_binding_error(msg: &str) -> bool {
+fn is_binding_error(msg: &str) -> bool {
     msg.contains("incompatible driver")
 }
 
@@ -91,12 +91,6 @@ pub fn is_binding_error(msg: &str) -> bool {
 /// wraps nusb errors deep enough that the top message is not enough).
 pub fn chain_is_binding_error(err: &anyhow::Error) -> bool {
     err.chain().any(|c| is_binding_error(&c.to_string()))
-}
-
-/// Directory the packages are materialized into for installation
-/// (`UpdateDriverForPlugAndPlayDevices` needs a real INF path).
-pub fn materialize_dir(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("capsula-jb-winusb-{tag}"))
 }
 
 /// Marker used by the CLI to detect a present board before the first
