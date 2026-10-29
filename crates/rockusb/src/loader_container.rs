@@ -119,11 +119,23 @@ impl LoaderContainer {
                     return Err(Error::Loader(format!("unknown entry type {other:#x}")));
                 }
             };
+            let data_offset = u32le(&data, e + 45);
+            let data_size = u32le(&data, e + 49);
+            // Bounds must hold for EVERY entry: a mid-table entry pointing
+            // past EOF would otherwise panic in download_stages' slicing
+            // (the final length check below only covers the last entry).
+            if data_offset as u64 + data_size as u64 > data.len() as u64 {
+                return Err(Error::Loader(format!(
+                    "entry {i} data ({data_offset}..{}) lies beyond the end of file ({})",
+                    data_offset + data_size,
+                    data.len()
+                )));
+            }
             entries.push(Entry {
                 kind,
                 name: wide2str(&data[e + 5..e + 45]),
-                data_offset: u32le(&data, e + 45),
-                data_size: u32le(&data, e + 49),
+                data_offset,
+                data_size,
                 data_delay: u32le(&data, e + 53),
             });
         }
@@ -257,6 +269,23 @@ mod tests {
         let crc = crc32_xrock(0, &data);
         data.extend_from_slice(&crc.to_le_bytes());
         LoaderContainer::parse(data).unwrap()
+    }
+
+    #[test]
+    fn entry_data_beyond_eof_rejected() {
+        // The LAST entry stays well-formed (the CRC path checks out),
+        // but the FIRST one points far past EOF: parse must refuse
+        // instead of panicking later in download_stages' slicing.
+        let c = synth_container();
+        let mut raw = c.data.clone();
+        raw[HEADER_SIZE + 45..HEADER_SIZE + 49].copy_from_slice(&0x7fff_0000u32.to_le_bytes());
+        // re-sign: the CRC covers everything up to the last entry's end
+        let last = c.entries.last().unwrap();
+        let len = last.data_offset as usize + last.data_size as usize;
+        let crc = crc32_xrock(0, &raw[..len]);
+        raw[len..len + 4].copy_from_slice(&crc.to_le_bytes());
+        let err = LoaderContainer::parse(raw).expect_err("must reject");
+        assert!(err.to_string().contains("beyond"), "{err}");
     }
 
     #[test]

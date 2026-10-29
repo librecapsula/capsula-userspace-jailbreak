@@ -326,15 +326,16 @@ impl<T: Transport> LoaderSession<T> {
     /// Read flash by LBA (READ_LBA): `xrock flash read`; buf.len() must
     /// be a multiple of 512, chunks of LBA_CHUNK sectors, length = n*512.
     pub fn read_lba(&mut self, sector: u32, buf: &mut [u8]) -> Result<()> {
-        assert!(
-            buf.len().is_multiple_of(512),
-            "read_lba: size must be a multiple of 512"
-        );
+        if !buf.len().is_multiple_of(512) {
+            return Err(Error::Loader(
+                "read_lba: size must be a multiple of 512".into(),
+            ));
+        }
         let total = (buf.len() / 512) as u32;
         let mut done = 0u32;
         while done < total {
             let n = (total - done).min(LBA_CHUNK);
-            let off = (done * 512) as usize;
+            let off = done as usize * 512;
             self.exec(
                 &RawCommand {
                     opcode: opcode::READ_LBA,
@@ -346,7 +347,7 @@ impl<T: Transport> LoaderSession<T> {
                     flag_in: true,
                 },
                 None,
-                Some(&mut buf[off..off + (n * 512) as usize]),
+                Some(&mut buf[off..off + n as usize * 512]),
             )?;
             done += n;
         }
@@ -356,15 +357,16 @@ impl<T: Transport> LoaderSession<T> {
     /// Write flash by LBA (WRITE_LBA): `xrock flash write`. **Destructive
     /// to the flash** — only call from explicit write pipelines.
     pub fn write_lba(&mut self, sector: u32, data: &[u8]) -> Result<()> {
-        assert!(
-            data.len().is_multiple_of(512),
-            "write_lba: size must be a multiple of 512"
-        );
+        if !data.len().is_multiple_of(512) {
+            return Err(Error::Loader(
+                "write_lba: size must be a multiple of 512".into(),
+            ));
+        }
         let total = (data.len() / 512) as u32;
         let mut done = 0u32;
         while done < total {
             let n = (total - done).min(LBA_CHUNK);
-            let off = (done * 512) as usize;
+            let off = done as usize * 512;
             self.exec(
                 &RawCommand {
                     opcode: opcode::WRITE_LBA,
@@ -375,7 +377,7 @@ impl<T: Transport> LoaderSession<T> {
                     length: n * 512,
                     flag_in: false,
                 },
-                Some(&data[off..off + (n * 512) as usize]),
+                Some(&data[off..off + n as usize * 512]),
                 None,
             )?;
             done += n;

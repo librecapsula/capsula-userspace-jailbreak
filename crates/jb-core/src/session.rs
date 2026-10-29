@@ -150,9 +150,7 @@ pub fn bring_up(
                 // will refuse our usbplug, and the reset itself would
                 // kick the running stock loader — keep it instead.
                 if serial.is_none() {
-                    serial = Some(
-                        rockusb::device_serial(&rockusb::DeviceMode::Loader).unwrap_or_default(),
-                    );
+                    serial = Some(read_loader_serial());
                 }
                 if !is_identifying(serial.as_deref().unwrap_or("")) {
                     // The loader persona did not yield a real serial
@@ -264,6 +262,17 @@ fn open_loader() -> rockusb::Result<LoaderSession<NusbTransport>> {
     Ok(LoaderSession::new(t, ep_in, ep_out))
 }
 
+/// The loader-persona serial, read and normalized exactly once. USB
+/// string descriptors can carry surrounding whitespace; both the
+/// firstgen classification and the backup directory key must see the
+/// same trimmed value.
+fn read_loader_serial() -> String {
+    rockusb::device_serial(&rockusb::DeviceMode::Loader)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 fn open_maskrom() -> rockusb::Result<NusbTransport> {
     NusbTransport::open(&rockusb::DeviceMode::MaskRom)
 }
@@ -342,5 +351,19 @@ mod tests {
         assert!(!is_identifying("000000000"));
         assert!(!is_identifying("0"));
         assert!(!is_identifying(""));
+    }
+
+    #[test]
+    fn padded_serial_still_classifies_as_regular() {
+        // a serial with surrounding whitespace must not flip the column
+        // into the firstgen path: classification sees the trimmed value
+        let raw = " 01139EB3613ABD80\r\n";
+        let s = raw.trim();
+        assert!(is_identifying(s));
+        assert!(!crate::firstgen::is_first_generation(s));
+        assert_eq!(
+            crate::backup_store::BackupStore::dir_name(raw),
+            "01139EB3613ABD80"
+        );
     }
 }

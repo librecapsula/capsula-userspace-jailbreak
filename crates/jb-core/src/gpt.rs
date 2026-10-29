@@ -88,26 +88,34 @@ impl Gpt {
         let first_usable = u64le(data, 40);
         let last_usable = u64le(data, 48);
         let entry_lba = u64le(data, 72);
-        let num_entries = u32le(data, 80) as usize;
-        let entry_size = u32le(data, 84) as usize;
+        let num_entries = u32le(data, 80);
+        let entry_size = u32le(data, 84);
         let entries_crc = u32le(data, 88);
         if entry_size < 128 || !entry_size.is_multiple_of(8) {
             return Err(GptError::Malformed(format!(
                 "entry_size={entry_size} is invalid"
             )));
         }
-        let need = (entry_lba as usize - 1) * LBA_SIZE + num_entries * entry_size;
-        if data.len() < need {
-            return Err(GptError::TooShort(need));
+        // The GPT comes raw from the device and may be garbage: every
+        // field feeding slice arithmetic must be bounds-checked here,
+        // never trusted (an entry_lba of 0 would underflow below).
+        if entry_lba < 2 {
+            return Err(GptError::Malformed(format!(
+                "entry_lba={entry_lba} is invalid (entries must follow LBA1)"
+            )));
         }
-        let entries_blob = &data[(entry_lba as usize - 1) * LBA_SIZE
-            ..(entry_lba as usize - 1) * LBA_SIZE + num_entries * entry_size];
+        let entries_off = (entry_lba - 1) * LBA_SIZE as u64;
+        let need = entries_off + num_entries as u64 * entry_size as u64;
+        if (data.len() as u64) < need {
+            return Err(GptError::TooShort(need as usize));
+        }
+        let entries_blob = &data[entries_off as usize..need as usize];
         if crc32(entries_blob) != entries_crc {
             return Err(GptError::BadEntriesCrc);
         }
 
         let mut entries = Vec::new();
-        for (i, e) in entries_blob.chunks_exact(entry_size).enumerate() {
+        for (i, e) in entries_blob.chunks_exact(entry_size as usize).enumerate() {
             if e[..16].iter().all(|&b| b == 0) {
                 continue; // empty entry (type GUID = 0)
             }
@@ -120,7 +128,16 @@ impl Gpt {
                 .take_while(|c| **c != [0, 0])
                 .map(|c| u16::from_le_bytes(*c))
                 .collect();
-            let name = String::from_utf16(&name_raw).unwrap_or_default();
+            let name = match String::from_utf16(&name_raw) {
+                Ok(n) => n,
+                Err(_) => {
+                    return Err(GptError::BadEntry {
+                        idx: i + 1,
+                        name: String::new(),
+                        reason: "invalid UTF-16 name".into(),
+                    });
+                }
+            };
             let idx = (i + 1) as u32;
             if first == 0 || last < first {
                 return Err(GptError::BadEntry {
@@ -162,7 +179,8 @@ impl Gpt {
             entries,
             first_usable_lba: first_usable,
             last_usable_lba: last_usable,
-            entries_end_lba: entry_lba + (num_entries * entry_size).div_ceil(LBA_SIZE) as u64,
+            entries_end_lba: entry_lba
+                + (num_entries as u64 * entry_size as u64).div_ceil(LBA_SIZE as u64),
         })
     }
 
@@ -271,5 +289,40 @@ mod tests {
     fn overlapping_partitions_rejected() {
         let data = synth_gpt(&[("a", 512, 512), ("b", 1023, 8)]); // b overlaps a
         assert!(matches!(Gpt::parse(&data), Err(GptError::Malformed(_))));
+    }
+
+    /// Rewrite a header field and re-sign the header CRC.
+    fn patch_header(data: &mut [u8], offset: usize, bytes: &[u8]) {
+        let hdr = &mut data[..512];
+        hdr[offset..offset + bytes.len()].copy_from_slice(bytes);
+        hdr[16..20].fill(0);
+        let hcrc = crc32(&hdr[..92]);
+        hdr[16..20].copy_from_slice(&hcrc.to_le_bytes());
+    }
+
+    #[test]
+    fn zero_entry_lba_rejected_without_underflow() {
+        // entry_lba == 0 used to underflow the slice arithmetic and
+        // panic in debug builds; it must come back as a parse error
+        let mut data = capsule14_like();
+        patch_header(&mut data, 72, &0u64.to_le_bytes());
+        match Gpt::parse(&data) {
+            Err(GptError::Malformed(msg)) => assert!(msg.contains("entry_lba"), "{msg}"),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_utf16_name_rejected() {
+        // a lone surrogate in a partition name must not silently turn
+        // into an empty name (two such partitions are indistinguishable)
+        let mut data = capsule14_like();
+        data[512 + 56..512 + 58].copy_from_slice(&0xD800u16.to_le_bytes());
+        let blob = data[512..512 + 8 * 128].to_vec();
+        patch_header(&mut data, 88, &crc32(&blob).to_le_bytes());
+        match Gpt::parse(&data) {
+            Err(GptError::BadEntry { reason, .. }) => assert!(reason.contains("UTF-16")),
+            other => panic!("expected BadEntry, got {other:?}"),
+        }
     }
 }

@@ -211,6 +211,19 @@ fn loader_bad_csw_rejected() {
     assert!(matches!(err, rockusb::Error::CommandFailed(1)), "{err}");
 }
 
+#[test]
+fn loader_lba_rejects_unaligned_size() {
+    // the library API reports an error instead of panicking; no transfer
+    // is attempted, so the scenario is empty
+    let mut s = LoaderSession::new(MockTransport::new(vec![]), EP_IN, EP_OUT);
+    let err = s.read_lba(0, &mut [0u8; 100]).expect_err("must refuse");
+    assert!(matches!(err, rockusb::Error::Loader(_)), "{err}");
+
+    let mut s = LoaderSession::new(MockTransport::new(vec![]), EP_IN, EP_OUT);
+    let err = s.write_lba(0, &[0u8; 100]).expect_err("must refuse");
+    assert!(matches!(err, rockusb::Error::Loader(_)), "{err}");
+}
+
 // --- maskrom (DownloadBoot) ----------------------------------------------
 
 #[test]
