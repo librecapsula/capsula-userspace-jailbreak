@@ -390,8 +390,39 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
         println!("{soc}");
         return Ok(());
     }
+    let mut s = s;
     let t0 = Instant::now();
     for c in cmds {
+        // "cycle <n>": n полных циклов перезахода в окно БЕЗ перезагрузки
+        // платы — вложенный `run try_auto_burn` реинициализирует гаджет
+        // (свежий бюджет окна), ловим переэнумерацию и стримим 4 МиБ из
+        // каждой новой сессии. Ответ вложенной команды теряется (гаджет
+        // роняет трубы) — шлём без ожидания статуса.
+        if let Some(n) = c.strip_prefix("cycle ") {
+            let n: u32 = n.parse().context("cycle <n>: не число")?;
+            for i in 1..=n {
+                println!("cycle {i}/{n}: убиваю окно (run try_auto_burn)...");
+                let _ = s.send_bulk_cmd("run try_auto_burn");
+                std::thread::sleep(Duration::from_millis(300));
+                let caught = Instant::now();
+                s = bring_up(Some(Duration::from_secs(30)), &progress)
+                    .context(format!("cycle {i}: новое окно не поймано за 30 с"))?;
+                println!(
+                    "cycle {i}/{n}: новое окно за {} мс — стримлю 4 МиБ...",
+                    caught.elapsed().as_millis()
+                );
+                let st = Instant::now();
+                let data = s
+                    .upload_read(amlogic::RAM_SCRATCH, 0x400_000)
+                    .context(format!("cycle {i}: стрим не прошёл"))?;
+                println!(
+                    "cycle {i}/{n}: {} байт за {} мс (окно живо)",
+                    data.len(),
+                    st.elapsed().as_millis()
+                );
+            }
+            continue;
+        }
         // "sleep <ms>": хостовая пауза, ничего не отправляется
         if let Some(ms) = c.strip_prefix("sleep ") {
             let ms: u64 = ms.parse().context("sleep <ms>: не число")?;
@@ -406,11 +437,64 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
             println!("id -> {soc} (+{}мс)", t0.elapsed().as_millis());
             continue;
         }
+        // "dlmem <size>": probe-download в DRAM (флеш не трогается):
+        // arm через TPL-канал (AM_REQ_TPL_CMD, как вендорский update) +
+        // media-пакеты + финальный TPL-статус. Проверка гипотезы, что
+        // download-передача переводит гаджет в состояние «burning идёт»
+        // и таймер update-окна перестаёт работать.
+        if let Some(size) = c.strip_prefix("dlmem ") {
+            let size = usize::from_str_radix(size.trim_start_matches("0x"), 16)
+                .context("dlmem <size>: не hex-число")?;
+            anyhow::ensure!(
+                size > 0 && size <= 4 << 20,
+                "dlmem <size>: 1..=0x400000"
+            );
+            let armed = s.tpl_cmd(&format!(
+                "download mem {:#x} normal {size:#x}",
+                amlogic::RAM_SCRATCH
+            ))?;
+            println!(
+                "dlmem {size:#x}: arm -> {armed} (+{}мс)",
+                t0.elapsed().as_millis()
+            );
+            let data = vec![0u8; size];
+            s.write_media_all(&data)?;
+            // финальный статус — из TPL-канала; общий буфер ответа сперва
+            // отдаёт склейки ack-ов (OK!!ess), поэтому ждём настоящий
+            // success терпеливо, а не падаем на первом мусоре
+            let mut st = String::new();
+            for _ in 0..100 {
+                match s.tpl_stat() {
+                    Ok(text) if text.starts_with("success") => {
+                        st = text;
+                        break;
+                    }
+                    Ok(text) => st = text,
+                    Err(e) => {
+                        st = format!("<tpl_stat: {e}>");
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            println!(
+                "dlmem {size:#x}: done -> {st} (+{}мс)",
+                t0.elapsed().as_millis()
+            );
+            continue;
+        }
         let r = if let Some((addr, size)) = parse_upload_cmd(c) {
             println!("читаю {size:#x} байт с {addr:#x}...");
             s.upload_read(addr, size).map(|data| {
-                hexdump(&data, addr);
-                format!("готово (+{}мс)", t0.elapsed().as_millis())
+                // большой поток — только начало + итог; hexdump 8 МиБ
+                // никому не нужен
+                let head = data.len().min(4096);
+                hexdump(&data[..head], addr);
+                format!(
+                    "готово: {} байт (+{}мс)",
+                    data.len(),
+                    t0.elapsed().as_millis()
+                )
             })
         } else {
             s.bulk_cmd(c)
@@ -443,7 +527,7 @@ fn parse_upload_cmd(c: &str) -> Option<(u32, usize)> {
     }
     let addr = u32::from_str_radix(t[2].trim_start_matches("0x"), 16).ok()?;
     let size = usize::from_str_radix(t[4].trim_start_matches("0x"), 16).ok()?;
-    if size == 0 || size > 0xffff {
+    if size == 0 || size > 0x80_0000 {
         return None;
     }
     Some((addr, size))
@@ -477,7 +561,7 @@ mod tests {
             Some((0x108_0000, 0x40))
         );
         assert_eq!(parse_upload_cmd("upload store data normal 0x100"), None);
-        assert_eq!(parse_upload_cmd("upload mem 0x0 normal 0x10000"), None);
+        assert_eq!(parse_upload_cmd("upload mem 0x0 normal 0x800001"), None);
         assert_eq!(parse_upload_cmd("printenv"), None);
     }
 }
