@@ -122,11 +122,16 @@ pub fn backup<T: Transport>(
         });
         let mut out = std::fs::File::create(&path)?;
         let mut hasher = Sha256::new();
+        // one reusable full-chunk buffer; the last chunk of a partition
+        // is a prefix slice
+        let mut chunk = vec![0u8; CHUNK_SECTORS as usize * 512];
         let mut done: u64 = 0;
         while done < e.sectors {
-            let n = ((e.sectors - done) as u32).min(CHUNK_SECTORS);
-            let mut chunk = vec![0u8; n as usize * 512];
-            s.read_lba((e.first_lba + done) as u32, &mut chunk)?;
+            let n = (e.sectors - done).min(CHUNK_SECTORS as u64) as usize;
+            let lba = u32::try_from(e.first_lba + done).map_err(|_| {
+                UsbError::Loader(format!("{}: LBA за пределами u32-протокола", e.name))
+            })?;
+            s.read_lba(lba, &mut chunk[..n * 512])?;
             if done == 0 && chunk[..512].iter().all(|&b| b == 0xcc) {
                 let _ = std::fs::remove_file(&path);
                 return Err(UsbError::WrongMode(format!(
@@ -134,8 +139,8 @@ pub fn backup<T: Transport>(
                     e.name
                 )));
             }
-            hasher.update(&chunk);
-            out.write_all(&chunk)?;
+            hasher.update(&chunk[..n * 512]);
+            out.write_all(&chunk[..n * 512])?;
             done += n as u64;
             progress(Progress::PartitionProgress {
                 name: e.name.clone(),
