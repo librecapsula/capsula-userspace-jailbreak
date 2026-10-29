@@ -8,8 +8,7 @@
 //! First-generation columns never get there (their BootROM rejects the
 //! loader); for them bring-up returns the stock u-boot rockusb loader
 //! (330d with a gift serial), and the caller runs the no-backup
-//! userdata flow. The fastboot persona (18d1:d00d) is an emergency
-//! state of that u-boot — never a working channel.
+//! userdata flow.
 
 use crate::config::Config;
 use crate::firstgen::is_first_generation;
@@ -112,8 +111,6 @@ fn refuse_unknown_identity(wait_loader: &mut Option<Instant>, progress: Progress
 ///   locked BootROM);
 /// - raw MaskROM (330e) with the serial already captured: download the
 ///   loader into RAM (flash untouched);
-/// - fastboot (18d1:d00d): an emergency state, not a working channel —
-///   fail fast with the recovery instruction;
 /// - empty bus / Linux gadget: print the hint and wait for a download mode.
 pub fn bring_up(
     config: &Config,
@@ -247,17 +244,6 @@ pub fn bring_up(
                 continue;
             }
             other => {
-                // fastboot (18d1:d00d) is an emergency state of the stock
-                // u-boot, not a working channel: fail fast with the
-                // recovery instruction instead of waiting forever
-                if matches!(other, rockusb::DeviceMode::Fastboot) {
-                    return Err(UsbError::WrongMode(
-                        "аварийный fastboot (18d1:d00d): передёрните питание \
-                         и войдите в режим лоадера заново (кнопка Recovery)"
-                            .into(),
-                    )
-                    .into());
-                }
                 if wait_loader.is_some() {
                     // after a refusal only the loader persona counts;
                     // keep waiting for it quietly

@@ -3,8 +3,8 @@
 //! These units ship a locked BootROM (`secure:yes` with first-generation
 //! keys): it silently refuses our usbplug, so the RAM-loader backup flow
 //! is impossible on them. What they DO expose in download mode is the
-//! stock u-boot — as a fastboot gadget (18d1:d00d) or its rockusb
-//! loader (2207:330d) — which is enough to flash userdata directly.
+//! stock u-boot rockusb loader (2207:330d) — enough to flash userdata
+//! directly.
 //!
 //! Recognition: the USB serial of the stock u-boot personas. Regular
 //! columns carry the chip UID, which starts with four digits

@@ -67,8 +67,6 @@ impl DeviceMonitor {
 /// Wait for a download mode (loader 330d / usbplug / MaskROM 330e) with
 /// debounce: a short blink (the dead 0006 gadget or contact bounce) does
 /// not count. Without a timeout — forever. Prints the hint once.
-/// (The fastboot gadget is deliberately not a download mode: on this
-/// hardware it is an emergency state, handled by the caller.)
 pub fn wait_download_mode(timeout: Option<Duration>, hint: &str) -> Result<DeviceMode> {
     let start = Instant::now();
     let mut monitor = DeviceMonitor::new();

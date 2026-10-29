@@ -17,12 +17,6 @@ pub enum DeviceMode {
     /// 2207:330e with iProduct == "USB-MSC" — usbplug runs in RAM.
     /// (Told apart by iProduct, not by the PID.)
     UsbPlug,
-    /// 18d1:d00d — the stock u-boot fastboot gadget ("USB download
-    /// gadget" by "Rockchip"). On the Capsula hardware this persona is
-    /// an EMERGENCY state, not a working channel: the tool never talks
-    /// to it and tells the user to power-cycle the device back into
-    /// loader mode.
-    Fastboot,
     /// 2207:0006 — Linux gadget (adb); NOT a download mode.
     LinuxGadget,
     /// Any other PID of the vendor (diagnostics).
@@ -34,18 +28,14 @@ impl DeviceMode {
         match self {
             DeviceMode::Loader => 0x330d,
             DeviceMode::MaskRom | DeviceMode::UsbPlug => 0x330e,
-            DeviceMode::Fastboot => 0xd00d,
             DeviceMode::LinuxGadget => 0x0006,
             DeviceMode::Other(p) => *p,
         }
     }
 
-    /// VID of this mode (the fastboot gadget enumerates under Google's).
+    /// VID of this mode (every persona enumerates under the vendor's).
     pub fn vid(&self) -> u16 {
-        match self {
-            DeviceMode::Fastboot => crate::USB_VID_FASTBOOT,
-            _ => crate::USB_VID_ROCKCHIP,
-        }
+        crate::USB_VID_ROCKCHIP
     }
 
     /// Does a bus device (vid, pid, iProduct) belong to this mode?
@@ -61,8 +51,7 @@ impl DeviceMode {
     }
 
     /// The "best" of the present modes: 330d > usbplug > maskrom >
-    /// fastboot > 0006 > others. None if the bus is empty. (Fastboot is
-    /// listed for diagnostics only — see the variant docs.)
+    /// 0006 > others. None if the bus is empty.
     pub fn best(modes: &[DeviceMode]) -> Option<DeviceMode> {
         if modes.contains(&DeviceMode::Loader) {
             return Some(DeviceMode::Loader);
@@ -72,9 +61,6 @@ impl DeviceMode {
         }
         if modes.contains(&DeviceMode::MaskRom) {
             return Some(DeviceMode::MaskRom);
-        }
-        if modes.contains(&DeviceMode::Fastboot) {
-            return Some(DeviceMode::Fastboot);
         }
         if modes.contains(&DeviceMode::LinuxGadget) {
             return Some(DeviceMode::LinuxGadget);
@@ -88,7 +74,6 @@ impl DeviceMode {
             DeviceMode::Loader => "u-boot loader (330d)".into(),
             DeviceMode::MaskRom => "MaskROM (330e)".into(),
             DeviceMode::UsbPlug => "usbplug (330e, USB-MSC)".into(),
-            DeviceMode::Fastboot => "fastboot (18d1:d00d, EMERGENCY state)".into(),
             DeviceMode::LinuxGadget => "Linux gadget (0006, not a download mode)".into(),
             DeviceMode::Other(p) => format!("other ({p:04x})"),
         }
@@ -255,24 +240,21 @@ pub fn device_serial(mode: &DeviceMode) -> Option<String> {
     find_device(mode).and_then(|d| d.serial_number().map(|s| s.to_string()))
 }
 
-/// All Rockchip modes currently on the bus (deduplicated). The fastboot
-/// gadget lives under the Google VID (u-boot g_dnl fastboot uses it),
-/// everything else under the Rockchip VID.
+/// All Rockchip modes currently on the bus (deduplicated). Devices
+/// under other VIDs (e.g. the stock u-boot fastboot gadget, which
+/// enumerates under Google's 18d1) are not ours — not listed.
 pub fn list_modes() -> Result<Vec<DeviceMode>> {
     let mut modes: Vec<DeviceMode> = Vec::new();
     for d in nusb::list_devices().wait()? {
-        let m = if d.vendor_id() == crate::USB_VID_FASTBOOT && d.product_id() == 0xd00d {
-            DeviceMode::Fastboot
-        } else if d.vendor_id() != crate::USB_VID_ROCKCHIP {
+        if d.vendor_id() != crate::USB_VID_ROCKCHIP {
             continue;
-        } else {
-            match d.product_id() {
-                0x330d => DeviceMode::Loader,
-                0x330e if d.product_string() == Some("USB-MSC") => DeviceMode::UsbPlug,
-                0x330e => DeviceMode::MaskRom,
-                0x0006 => DeviceMode::LinuxGadget,
-                p => DeviceMode::Other(p),
-            }
+        }
+        let m = match d.product_id() {
+            0x330d => DeviceMode::Loader,
+            0x330e if d.product_string() == Some("USB-MSC") => DeviceMode::UsbPlug,
+            0x330e => DeviceMode::MaskRom,
+            0x0006 => DeviceMode::LinuxGadget,
+            p => DeviceMode::Other(p),
         };
         if !modes.contains(&m) {
             modes.push(m);

@@ -39,13 +39,6 @@ pub use transport::{
 
 /// USB VID of all Rockchip modes.
 pub const USB_VID_ROCKCHIP: u16 = 0x2207;
-/// USB VID the stock u-boot enumerates its fastboot gadget under
-/// (Google's, by u-boot tradition). The tool never talks to it: on the
-/// Capsula hardware this persona means an EMERGENCY state — the only
-/// correct action is a power cycle back into loader mode.
-pub const USB_VID_FASTBOOT: u16 = 0x18d1;
-/// fastboot gadget PID (under [`USB_VID_FASTBOOT`]).
-pub const USB_PID_FASTBOOT: u16 = 0xd00d;
 /// MaskROM (BootROM) PID — the same after `db` (usbplug): told apart by
 /// iProduct == "USB-MSC".
 pub const USB_PID_MASKROM: u16 = 0x330e;
