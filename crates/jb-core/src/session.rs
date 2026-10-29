@@ -33,6 +33,21 @@ pub enum Progress {
     PartitionDone {
         name: String,
     },
+    /// Байтовая передача (amlogic-потоки: захват разделов, полный дамп
+    /// NAND, запись раздела) — те же события, что и Partition*, но
+    /// единица — байт, а не сектор.
+    TransferStart {
+        name: String,
+        bytes: u64,
+    },
+    TransferProgress {
+        name: String,
+        done: u64,
+        total: u64,
+    },
+    TransferDone {
+        name: String,
+    },
 }
 
 pub type ProgressFn<'a> = &'a dyn Fn(Progress);

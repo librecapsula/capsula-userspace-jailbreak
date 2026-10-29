@@ -11,6 +11,7 @@
 //! USB device belongs to) lives one level up, in jb-cli
 //! (`backend::Backend` / `rockchip`).
 
+pub mod aml;
 pub mod backup;
 pub mod backup_store;
 pub mod config;

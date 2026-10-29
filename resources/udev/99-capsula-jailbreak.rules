@@ -1,5 +1,6 @@
-# capsula-jb: rootless access to the Rockchip USB modes.
+# capsula-jb: rootless access to the Rockchip and Amlogic USB modes.
 # Install: sudo cp 99-capsula-jailbreak.rules /etc/udev/rules.d/ && sudo udevadm control --reload
 SUBSYSTEM=="usb", ATTR{idVendor}=="2207", ATTR{idProduct}=="330d", TAG+="uaccess", MODE="0660"
 SUBSYSTEM=="usb", ATTR{idVendor}=="2207", ATTR{idProduct}=="330e", TAG+="uaccess", MODE="0660"
 SUBSYSTEM=="usb", ATTR{idVendor}=="2207", ATTR{idProduct}=="0006", TAG+="uaccess", MODE="0660"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1b8e", ATTR{idProduct}=="c003", TAG+="uaccess", MODE="0660"

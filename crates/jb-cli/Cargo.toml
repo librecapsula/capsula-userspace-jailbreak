@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 jb-core = { workspace = true }
 rockusb = { workspace = true }
+amlogic = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }

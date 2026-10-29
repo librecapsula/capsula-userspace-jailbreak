@@ -8,10 +8,12 @@ repository.workspace = true
 
 [dependencies]
 rockusb = { workspace = true }
+amlogic = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
 crc32fast = { workspace = true }

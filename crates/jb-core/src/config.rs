@@ -28,6 +28,9 @@ pub struct UsbplugPatch {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Hint {
     pub text: String,
+    /// Подсказка для Amlogic-мин (1b8e:c003): короткое download-окно
+    /// поднимается само на каждом включении — нажимать ничего не надо.
+    pub amlogic_text: String,
 }
 
 /// Path of the source TOML in the repository (for the sync test).
@@ -62,6 +65,7 @@ mod tests {
         assert_eq!(c.usbplug.signature2_addr, 0x0301_2390);
         assert_eq!(c.usbplug.signature2_hex, "29c54eb91f01096bc2000054");
         assert!(c.hint.text.contains("2207:330d"));
+        assert!(c.hint.amlogic_text.contains("1b8e:c003"));
     }
 
     #[test]

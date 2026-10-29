@@ -25,9 +25,10 @@ main (jb-cli) — только входная точка: разбор аргу�
 платформы различаются по VID:PID, опрос — через `Backend::present`).
 Контракт — `jb-cli/src/backend.rs` (`jailbreak` / `backup` / `present`
 / `wait_hint`); реализация rockchip — `jb-cli/src/rockchip.rs`
-(весь сценарий, WinUSB-драйверы win-drv, монитор шины), домен — jb-core.
+(весь сценарий, WinUSB-драйверы win-drv), домен — jb-core.
 Будущая платформа = новый модуль-бэкенд в jb-cli по контракту + строка
-в `main::backends()`; rockchip-модуль при этом трогать не нужно.
+в `main::backends()`; существующие модули других платформ при этом
+трогать не нужно. Сегодня бэкендов два: rockchip и amlogic.
 
 ## Первое поколение (подарочные колонки)
 
@@ -77,17 +78,64 @@ main (jb-cli) — только входная точка: разбор аргу�
   парсеры (исторически предел ставил рекурсивный парсинг
   OTA-манифеста, требовавший больше дефолтных для MSVC-линкера 1 МиБ).
   Конфиг не удалять и не занижать.
-- `BULK_IN_MAX` в `rockusb/src/transport.rs` (1 МиБ) — потолок одного
-  bulk-IN запроса на Windows: nusb включает RAW_IO, и WinUSB не дробит
-  RAW_IO-запросы — всё выше maximum transfer size хост-стека (замерено:
-  2 МиБ проходит, 3 МиБ падает с `usb: unknown (error 1)`) отклоняется
-  мгновенно. Проверить потолок на новом железе:
+- `BULK_IN_MAX` в `rockusb/src/transport.rs` и его копия в
+  `amlogic/src/transport.rs` (1 МиБ) — потолок одного bulk-IN запроса
+  на Windows: nusb включает RAW_IO, и WinUSB не дробит RAW_IO-запросы —
+  всё выше maximum transfer size хост-стека (замерено: 2 МиБ проходит,
+  3 МиБ падает с `usb: unknown (error 1)`) отклоняется мгновенно.
+  Проверить потолок на новом железе:
   `cargo run -p jb-core --example readsize --release`.
 - Файлы в `resources/drivers/winusb/` (INF+CAT+CER) — подписанные
   артефакты Zadig/libwdi: каталог подписывает ровно этот INF, поэтому
   их нельзя переименовывать и править (включая DriverVer). Новый PID =
   новый пакет против живого устройства — процедура в
   `resources/drivers/winusb/README.md`.
+
+## Amlogic (Capsula Mini поздних ревизий, A113X)
+
+Мини на Amlogic — второй бэкенд (`jb-cli/src/amlogic.rs`), протокол —
+крейт `crates/amlogic` (порт вендорского update/burning-протокола
+`1b8e:c003`: identify, память, bulkcmd, media download/upload).
+Транспорт — внутри крейта, отдельного usbcore НЕТ и заведомо не делать:
+amlogic нужны пер-запросные таймауты control-передач, short bulk-чтения
+с сохранением префикса, наблюдаемые ZLP и port reset — семантика,
+которой у rockchip-транспорта нет. Формат провода, таймауты и строки
+статуса — по реверс-инжиниринг-спецификации «Amlogic A113X USB
+Protocol Specification» (AML-A113X-USB-1.0) и pyamlboot.
+
+- Download-окно: стоковый u-boot поднимает `1b8e:c003` при каждом
+  включении на ~450 мс. Ловится горячим циклом open+identify+prime
+  (`bring_up` в бэкенде): «нет устройства» = пустая шина, до 10
+  подряд неудачных open/identify = устойчивая проблема (обычно
+  драйвер). identify шлётся немедленно, первый bulkcmd сессии —
+  жертвенный `echo` (prime); стадия обязана быть TPL (u-boot burning
+  gadget) — BootROM мини залочен паролем и для сценария бесполезен.
+- Полный захват — однопроходный (`jb_core::aml::backup`): окружение
+  u-boot, разделы по логической ёмкости (`store size`, бед-блоки
+  исключены), зарезервированные области, сырой NAND целиком (с OOB).
+  Формат — `backup/amlogic-<время>-<pid>-<n>/` с `manifest.json`
+  (schema 1, контрольные суммы, статус); серийника у amlogic-мин нет —
+  каждый запуск снимает свежий захват, кеша как у rockchip нет.
+  Укороченные файлы остаются `.partial` со статусом Warnings.
+- Запись: образ `data` (тот же оверлей adbd через
+  `userdata::build_image`) пишется `download store data normal <size>`
+  + media-пакеты по 64 КиБ (`amlogic::store::write_store`; короткий
+  хвост допускается — устройство считает байты против объявленного
+  total). **Путь записи не проверен на живом железе** (в PR-стеке
+  останавливались на захвате): формат media-передачи сверен со
+  спецификацией и устройством, но первый прогон на колонке делать
+  осознанно, с готовым захватом для отката.
+- Партиции Capsula Mini (NAND 256 МиБ): таблица `amlogic::PARTITIONS`
+  (bootloader/tpl/misc/boot_a/boot_b/system_a/system_b/data);
+  AML-reserved-области (bbt/env/keys/dtbrsv/ddr) device-уникальны и из
+  дампа НЕ прошиваются.
+- `capsula-jb aml "<cmd>"` — пасстру burning-команд (диагностика;
+  `upload mem <addr> normal <size>` печатает hexdump, `sleep <ms>` —
+  хостовая пауза, `id` — одиночный identify-keepalive).
+- Windows: WinUSB-пакета под `1b8e:c003` нет (новый PID = генерация
+  пакета против живого устройства, процедура в
+  `resources/drivers/winusb/README.md`) — привязка вручную через Zadig,
+  win-drv об amlogic-устройствах не ведает.
 
 ## win-drv (Windows-драйверы)
 

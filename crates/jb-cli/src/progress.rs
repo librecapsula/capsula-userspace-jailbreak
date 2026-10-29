@@ -41,6 +41,26 @@ impl CliProgress {
             Progress::PartitionDone { .. } => {
                 self.finish_bar();
             }
+            Progress::TransferStart { name, bytes } => {
+                self.finish_bar();
+                let pb = ProgressBar::new(bytes);
+                pb.set_style(
+                    ProgressStyle::with_template(
+                        "{msg} [{elapsed_precise}] {bar:30.cyan/blue} {bytes}/{total_bytes}",
+                    )
+                    .unwrap(),
+                );
+                pb.set_message(name);
+                *self.bar.borrow_mut() = Some(pb);
+            }
+            Progress::TransferProgress { done, total, .. } => {
+                if let Some(b) = self.bar.borrow().as_ref() {
+                    b.set_position(done.min(total));
+                }
+            }
+            Progress::TransferDone { .. } => {
+                self.finish_bar();
+            }
         }
     }
 

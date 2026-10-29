@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rockusb",
+    "crates/amlogic",
     "crates/jb-core",
     "crates/jb-cli",
     "crates/win-drv",
@@ -16,6 +17,7 @@ repository = "https://github.com/LibreCapsula/capsula-userspace-jailbreak"
 [workspace.dependencies]
 # internal
 rockusb = { path = "crates/rockusb" }
+amlogic = { path = "crates/amlogic" }
 jb-core = { path = "crates/jb-core" }
 win-drv = { path = "crates/win-drv" }
 
@@ -30,6 +32,7 @@ env_logger = "0.11"
 
 # formats / data
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1"
 sha2 = "0.11"
 crc32fast = "1"

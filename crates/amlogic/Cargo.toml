@@ -1,0 +1,16 @@
+[package]
+name = "amlogic"
+description = "Native Amlogic update/USB-burning protocol (BootROM and u-boot stages) with its own nusb transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nusb = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }

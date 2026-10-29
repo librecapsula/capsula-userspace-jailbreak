@@ -4,12 +4,14 @@
 //!
 //! main — входная точка: разбор аргументов, выбор платформенного
 //! бэкенда по USB-устройству на шине и запуск сценария. Вся логика
-//! платформы — в модулях-бэкендах (контракт — `backend::Backend`,
-//! сегодня это `rockchip`).
+//! платформы — в модулях-бэкендах (контракт — `backend::Backend`;
+//! сегодня это `rockchip` и `amlogic`).
 
+mod amlogic;
 mod backend;
 mod progress;
 mod rockchip;
+mod util;
 
 use anyhow::bail;
 use clap::{Parser, Subcommand};
@@ -49,6 +51,13 @@ enum Command {
     Backup,
     /// Живой лог USB-событий
     Monitor,
+    /// Amlogic-мини: identify платы и пасстру u-boot burning-команд
+    /// (диагностика; пример: capsula-jb aml "printenv bootdelay")
+    Aml {
+        /// Команды по очереди; без команд — только identify
+        #[arg(value_name = "CMD")]
+        cmds: Vec<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -75,7 +84,9 @@ fn main() -> anyhow::Result<()> {
         }
         // Монитор не ждёт устройства и не строит драйверную сессию —
         // только живой лог шины.
-        Some(Command::Monitor) => rockchip::monitor_bus(),
+        Some(Command::Monitor) => monitor_bus(),
+        // Пасстру — диагностика Amlogic-мин, вне основного сценария.
+        Some(Command::Aml { cmds }) => amlogic::passthrough(wait, &cmds),
     };
     // Launched from a normal console, Windows elevates the tool into a
     // NEW console window (see the UAC manifest note in .cargo/config.toml);
@@ -89,7 +100,10 @@ fn main() -> anyhow::Result<()> {
 /// добавляется сюда: опознаётся по своему USB-устройству (`present`),
 /// сценарий — через тот же контракт `backend::Backend`.
 fn backends() -> Vec<Box<dyn backend::Backend>> {
-    vec![Box::new(rockchip::Rockchip::new())]
+    vec![
+        Box::new(rockchip::Rockchip::new()),
+        Box::new(amlogic::Amlogic::new()),
+    ]
 }
 
 /// Выбор бэкенда по USB-устройству на шине: ждём, пока появится
@@ -124,6 +138,56 @@ fn pick_backend(wait: Option<Duration>) -> anyhow::Result<Box<dyn backend::Backe
             if start.elapsed() >= t {
                 bail!("ни одна поддерживаемая платформа не появилась на шине (--wait)");
             }
+        }
+        std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
+    }
+}
+
+/// Живой лог USB-событий обоих вендоров: rockchip-монитор (2207:*) плюс
+/// отслеживание появления/пропадания 1b8e:c003.
+fn monitor_bus() -> anyhow::Result<()> {
+    println!("Монитор USB (2207:* rockchip, 1b8e:c003 amlogic), Ctrl-C — выход.");
+    let mut m = rockusb::DeviceMonitor::new();
+    let mut amlogic_on_bus = ::amlogic::present().unwrap_or(false);
+    m.poll()?;
+    if let Some(best) = rockusb::transport::DeviceMode::best(m.modes()) {
+        println!("сейчас на шине: 2207:{:04x} ({})", best.pid(), best.label());
+    }
+    if amlogic_on_bus {
+        println!(
+            "[{}] сейчас на шине: 1b8e:c003 (amlogic download)",
+            util::ts()
+        );
+    }
+    loop {
+        for ev in m.poll()? {
+            match ev {
+                rockusb::monitor::MonitorEvent::Appeared(mode) => {
+                    println!(
+                        "[{}] появился 2207:{:04x} ({})",
+                        util::ts(),
+                        mode.pid(),
+                        mode.label()
+                    )
+                }
+                rockusb::monitor::MonitorEvent::Disappeared(mode) => {
+                    println!(
+                        "[{}] пропал   2207:{:04x} ({})",
+                        util::ts(),
+                        mode.pid(),
+                        mode.label()
+                    )
+                }
+            }
+        }
+        let now = ::amlogic::present().unwrap_or(amlogic_on_bus);
+        if now != amlogic_on_bus {
+            if now {
+                println!("[{}] появился 1b8e:c003 (amlogic download)", util::ts());
+            } else {
+                println!("[{}] пропал   1b8e:c003 (amlogic download)", util::ts());
+            }
+            amlogic_on_bus = now;
         }
         std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
     }
