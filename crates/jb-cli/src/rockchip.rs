@@ -25,8 +25,9 @@ use std::time::Duration;
 const GADGET_STABLE: Duration = Duration::from_secs(10);
 
 /// The live device as the flow sees it (after bring-up). The `firstgen`
-/// flag selects the path inside the shared flow: first generation works
-/// over the stock loader and has no backup.
+/// flag selects the path inside the shared flow: first generation and
+/// --no-backup runs work over the stock loader (330d) and have no
+/// backup.
 struct Device {
     session: rockusb::LoaderSession<NusbTransport>,
     serial: String,
@@ -34,7 +35,7 @@ struct Device {
     /// gift serial — no backup possible, userdata is built from scratch.
     firstgen: bool,
     /// A fresh backup was taken this run (false = a verified backup for
-    /// this serial already existed, or first generation).
+    /// this serial already existed, first generation, or --no-backup).
     dumped: bool,
 }
 
@@ -125,8 +126,9 @@ fn backup_dir(serial: &str) -> PathBuf {
 }
 
 /// Steps 1-3 (loader, device, full dump into backup/) for regular
-/// columns; for first-generation personas the same session mechanics,
-/// but no backup — that hardware cannot run our usbplug.
+/// columns; for first-generation personas and --no-backup runs the
+/// same session mechanics stay on the stock loader (330d) — no dump
+/// (that hardware cannot run our usbplug / the flag skips it).
 ///
 /// On Windows the board hops between devnodes (330d loader, 330e
 /// MaskROM/usbplug) and a fresh devnode may be grabbed by a vendor
@@ -211,7 +213,7 @@ fn dump_all_once(
     let p = CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
     let mut bus = jb_core::session::UsbBus;
-    let up = match bring_up(&mut bus, config, &loader, wait, &progress) {
+    let up = match bring_up(&mut bus, config, &loader, wait, no_backup, &progress) {
         Ok(v) => v,
         Err(BringUpError::LoaderRejected) => bail!(
             "usbplug не запустился: BootROM отклонил лоадер (неподдерживаемая \
