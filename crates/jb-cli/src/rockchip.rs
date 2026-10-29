@@ -86,14 +86,15 @@ impl Backend for Rockchip {
         &mut self,
         yes: bool,
         format_userdata: bool,
+        no_backup: bool,
         wait: Option<Duration>,
     ) -> anyhow::Result<()> {
-        let mut dev = dump_all(wait, &self.config, &mut self.drivers)?;
-        write_userdata(&mut dev, yes, format_userdata, wait)
+        let mut dev = dump_all(wait, &self.config, &mut self.drivers, no_backup)?;
+        write_userdata(&mut dev, yes, format_userdata, no_backup, wait)
     }
 
     fn backup(&mut self, wait: Option<Duration>) -> anyhow::Result<()> {
-        let dev = dump_all(wait, &self.config, &mut self.drivers)?;
+        let dev = dump_all(wait, &self.config, &mut self.drivers, false)?;
         if dev.firstgen {
             bail!(
                 "первое поколение: полный дамп невозможен (BootROM залочен). \
@@ -136,6 +137,7 @@ fn dump_all(
     wait: Option<Duration>,
     config: &Config,
     drivers: &mut win_drv::Session,
+    no_backup: bool,
 ) -> anyhow::Result<Device> {
     if win_drv::any_rockchip_node_misbound() {
         println!("устройство Rockchip без WinUSB — ставлю драйвер");
@@ -144,7 +146,7 @@ fn dump_all(
 
     const ATTEMPTS: u32 = 5;
     for attempt in 1..=ATTEMPTS {
-        match dump_all_once(wait, config) {
+        match dump_all_once(wait, config, no_backup) {
             Ok(s) => return Ok(s),
             Err(e) => {
                 let binding_error = win_drv::chain_is_binding_error(&e);
@@ -200,7 +202,11 @@ fn start_or_wait_drivers(drivers: &mut win_drv::Session, settle: Duration) {
 /// One bring-up + dump attempt (no retries). The first-generation
 /// classification lives in bring_up (jb-core): the returned `firstgen`
 /// flag drives everything downstream.
-fn dump_all_once(wait: Option<Duration>, config: &Config) -> anyhow::Result<Device> {
+fn dump_all_once(
+    wait: Option<Duration>,
+    config: &Config,
+    no_backup: bool,
+) -> anyhow::Result<Device> {
     let loader = jb_core::loader::embedded().context("не удалось разобрать вшитый лоадер")?;
     let p = CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
@@ -232,7 +238,13 @@ fn dump_all_once(wait: Option<Duration>, config: &Config) -> anyhow::Result<Devi
     let dir = backup_dir(&serial);
     // A verified backup of THIS column exists -> skip the dump
     // and go straight to the userdata write.
-    let dumped = if BackupStore::exists_verified(&dir) {
+    let dumped = if no_backup {
+        println!(
+            "--no-backup: бэкап не проверяю и не снимаю — userdata будет \
+             собран с нуля, текущее содержимое теряется"
+        );
+        false
+    } else if BackupStore::exists_verified(&dir) {
         println!(
             "валидный бэкап уже есть в {} — дамп пропускаю (удалите \
              каталог, чтобы снять заново)",
@@ -262,6 +274,7 @@ fn write_userdata(
     dev: &mut Device,
     yes: bool,
     format_userdata: bool,
+    no_backup: bool,
     wait: Option<Duration>,
 ) -> anyhow::Result<()> {
     if dev.firstgen {
@@ -286,9 +299,9 @@ fn write_userdata(
         println!("раздел userdata: {} (из GPT колонки)", humansize(part_size));
     }
 
-    let fresh = dev.firstgen || format_userdata;
+    let fresh = dev.firstgen || format_userdata || no_backup;
     let dump = image_base(dev, fresh)?;
-    confirm_write(dev.firstgen, fresh, yes, part_size)?;
+    confirm_write(dev.firstgen, fresh, no_backup, yes, part_size)?;
 
     let marker = format!("capsula-jb userspace {}\n", utc_now_iso());
     let out = PathBuf::from("work").join("userdata.img");
@@ -333,13 +346,22 @@ fn image_base(dev: &Device, fresh: bool) -> anyhow::Result<Option<PathBuf>> {
 
 /// Ask for the write confirmation (skipped with --yes). Nothing has
 /// been written at this point, so a refusal is safe.
-fn confirm_write(firstgen: bool, fresh: bool, yes: bool, part_size: u64) -> anyhow::Result<()> {
+fn confirm_write(
+    firstgen: bool,
+    fresh: bool,
+    no_backup: bool,
+    yes: bool,
+    part_size: u64,
+) -> anyhow::Result<()> {
     if yes {
         return Ok(());
     }
     let mode = if firstgen {
         "оверлей adbd на чистый ext2 — бэкапа на первом поколении нет, \
          текущее содержимое теряется"
+    } else if no_backup {
+        "оверлей adbd на чистый ext2 (--no-backup: бэкап не снимался, \
+         текущее содержимое теряется)"
     } else if fresh {
         "оверлей adbd на чистый ext2 (--format-userdata, содержимое теряется)"
     } else {

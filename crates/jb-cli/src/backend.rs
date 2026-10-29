@@ -24,11 +24,13 @@ pub trait Backend {
     }
 
     /// Полный сценарий: подключение → дамп → оверлей adbd в userdata →
-    /// запись → перезагрузка → ожидание ADB.
+    /// запись → перезагрузка → ожидание ADB. `no_backup` пропускает и
+    /// проверку, и съём дампа (userdata собирается с нуля).
     fn jailbreak(
         &mut self,
         yes: bool,
         format_userdata: bool,
+        no_backup: bool,
         wait: Option<Duration>,
     ) -> anyhow::Result<()>;
 

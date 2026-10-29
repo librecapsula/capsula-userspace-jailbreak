@@ -34,6 +34,11 @@ struct Cli {
     #[arg(long)]
     format_userdata: bool,
 
+    /// Не проверять и не снимать бэкап: userdata собирается с нуля
+    /// (содержимое теряется; крайние случаи — например, битый каталог)
+    #[arg(long)]
+    no_backup: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -61,8 +66,13 @@ fn main() -> anyhow::Result<()> {
         Some(Duration::from_secs(cli.wait))
     };
     let result = match cli.command {
-        None => pick_backend(wait)?.jailbreak(cli.yes, cli.format_userdata, wait),
-        Some(Command::Backup) => pick_backend(wait)?.backup(wait),
+        None => pick_backend(wait)?.jailbreak(cli.yes, cli.format_userdata, cli.no_backup, wait),
+        Some(Command::Backup) => {
+            if cli.no_backup {
+                bail!("--no-backup несовместим с подкомандой backup");
+            }
+            pick_backend(wait)?.backup(wait)
+        }
         // Монитор не ждёт устройства и не строит драйверную сессию —
         // только живой лог шины.
         Some(Command::Monitor) => rockchip::monitor_bus(),
