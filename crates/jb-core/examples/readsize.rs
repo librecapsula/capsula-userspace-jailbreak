@@ -16,12 +16,13 @@
 
 use jb_core::backup::patch_read_limit;
 use jb_core::config::Config;
-use jb_core::session::{bring_up, BringUpError};
+use jb_core::session::{bring_up, BringUpError, UsbBus};
 
 fn main() -> anyhow::Result<()> {
     let config = Config::embedded();
     let loader = jb_core::loader::embedded()?;
-    let up = match bring_up(&config, &loader, None, &|_| {}) {
+    let mut bus = UsbBus;
+    let up = match bring_up(&mut bus, &config, &loader, None, &|_| {}) {
         Ok(v) => v,
         Err(BringUpError::LoaderRejected) => anyhow::bail!("BootROM rejected the loader"),
         Err(e) => return Err(e.into()),

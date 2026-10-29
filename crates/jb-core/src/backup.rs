@@ -4,8 +4,7 @@
 
 use crate::backup_store::{append_sha256_line, file_sha256};
 use crate::config::Config;
-use crate::gpt::Gpt;
-use crate::session::{Progress, ProgressFn};
+use crate::session::{read_gpt, Progress, ProgressFn};
 use rockusb::loader::LoaderSession;
 use rockusb::{Error as UsbError, Transport};
 use sha2::{Digest, Sha256};
@@ -92,10 +91,7 @@ pub fn backup<T: Transport>(
     let old_limit = patch_read_limit(s, config, progress)?;
     cc_guard(s, progress)?;
 
-    progress(Progress::Step("читаю GPT".into()));
-    let mut gpt_raw = vec![0u8; 34 * 512];
-    s.read_lba(1, &mut gpt_raw)?;
-    let gpt = Gpt::parse(&gpt_raw).map_err(|e| UsbError::Loader(format!("GPT: {e}")))?;
+    let (gpt, gpt_raw) = read_gpt(s, progress)?;
 
     std::fs::create_dir_all(out_dir)?;
     std::fs::write(out_dir.join(".gpt.bin"), &gpt_raw)?;

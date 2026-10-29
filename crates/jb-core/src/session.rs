@@ -12,11 +12,9 @@
 
 use crate::config::Config;
 use crate::firstgen::is_first_generation;
-use rockusb::loader::RESET_SUBCODE_MASKROM;
+use rockusb::loader::{LoaderSession, RESET_SUBCODE_MASKROM};
 use rockusb::monitor::wait_download_mode;
-use rockusb::{
-    Error as UsbError, LoaderContainer, LoaderSession, MaskRomSession, NusbTransport, Transport,
-};
+use rockusb::{Error as UsbError, LoaderContainer, MaskRomSession, NusbTransport, Transport};
 use std::time::{Duration, Instant};
 
 /// Progress events for CLI/GUI.
@@ -54,13 +52,83 @@ pub enum BringUpError {
 /// generation — the persona is the stock u-boot rockusb loader (330d
 /// with a gift serial); a full backup is impossible on that hardware,
 /// userdata is written through the stock WRITE_LBA.
-pub struct BroughtUp {
-    pub session: LoaderSession<NusbTransport>,
+pub struct BroughtUp<T: Transport> {
+    pub session: LoaderSession<T>,
     /// The column identity serial for the backup key. Read exactly once
     /// (at the loader persona recognition); always identifying —
     /// bring_up refuses personas that cannot identify the column.
     pub serial: String,
     pub firstgen: bool,
+}
+
+/// The bus operations bring_up is built on — the seam that keeps the
+/// state machine testable without hardware (production: [`UsbBus`]
+/// over the rockusb bus helpers).
+pub trait Bus {
+    type T: Transport;
+    /// Best persona on the bus right now (None = no download device).
+    fn poll(&mut self) -> rockusb::Result<Option<rockusb::DeviceMode>>;
+    /// iSerialNumber of the loader persona (330d), if it is on the bus.
+    fn loader_serial(&mut self) -> Option<String>;
+    /// Open a rockusb session: the loader persona, or a leftover usbplug
+    /// (both speak the same protocol).
+    fn open_loader(&mut self) -> rockusb::Result<LoaderSession<Self::T>>;
+    /// Open the raw MaskROM transport (330e without USB-MSC).
+    fn open_maskrom(&mut self) -> rockusb::Result<Self::T>;
+    /// Wait for any download persona with debounce; prints the hint.
+    fn wait_download_mode(
+        &mut self,
+        timeout: Option<Duration>,
+        hint: &str,
+    ) -> rockusb::Result<rockusb::DeviceMode>;
+    /// Wait for a specific persona to appear on the bus.
+    fn wait_mode(&mut self, mode: rockusb::DeviceMode, timeout: Duration) -> rockusb::Result<()>;
+}
+
+/// The loader-persona serial, read and normalized exactly once. USB
+/// string descriptors can carry surrounding whitespace; both the
+/// firstgen classification and the backup directory key must see the
+/// same trimmed value.
+fn normalize_serial(raw: Option<String>) -> String {
+    raw.unwrap_or_default().trim().to_string()
+}
+
+/// The real bus: thin wrappers over the rockusb global helpers.
+pub struct UsbBus;
+
+impl Bus for UsbBus {
+    type T = NusbTransport;
+
+    fn poll(&mut self) -> rockusb::Result<Option<rockusb::DeviceMode>> {
+        rockusb::current_mode()
+    }
+
+    fn loader_serial(&mut self) -> Option<String> {
+        rockusb::device_serial(&rockusb::DeviceMode::Loader)
+    }
+
+    fn open_loader(&mut self) -> rockusb::Result<LoaderSession<NusbTransport>> {
+        let t = NusbTransport::open(&rockusb::DeviceMode::Loader)
+            .or_else(|_| NusbTransport::open(&rockusb::DeviceMode::UsbPlug))?;
+        let (ep_in, ep_out) = (t.ep_in, t.ep_out);
+        Ok(LoaderSession::new(t, ep_in, ep_out))
+    }
+
+    fn open_maskrom(&mut self) -> rockusb::Result<NusbTransport> {
+        NusbTransport::open(&rockusb::DeviceMode::MaskRom)
+    }
+
+    fn wait_download_mode(
+        &mut self,
+        timeout: Option<Duration>,
+        hint: &str,
+    ) -> rockusb::Result<rockusb::DeviceMode> {
+        wait_download_mode(timeout, hint)
+    }
+
+    fn wait_mode(&mut self, mode: rockusb::DeviceMode, timeout: Duration) -> rockusb::Result<()> {
+        rockusb::monitor::wait_mode(mode, timeout)
+    }
 }
 
 /// Does this USB serial identify the column? Gadget fallbacks report
@@ -82,15 +150,15 @@ fn refuse_unknown_identity(wait_loader: &mut Option<Instant>, progress: Progress
         return;
     }
     *wait_loader = Some(Instant::now());
-    progress(Progress::Step(
-        "серийник колонки неизвестен: перезапустите её в режим лоадера \
-         (выключить питание, зажать Recovery, включить) — без серийника \
-         инструмент не может выбрать путь"
-            .into(),
-    ));
+    let mut msg = "серийник колонки неизвестен: перезапустите её в режим лоадера \
+                   (выключить питание, зажать Recovery, включить) — без серийника \
+                   инструмент не может выбрать путь"
+        .to_string();
     if !hint.is_empty() {
-        println!("{hint}");
+        msg.push('\n');
+        msg.push_str(hint);
     }
+    progress(Progress::Step(msg));
 }
 
 /// Bring the board into a working session. Returns the session with the
@@ -112,12 +180,13 @@ fn refuse_unknown_identity(wait_loader: &mut Option<Instant>, progress: Progress
 /// - raw MaskROM (330e) with the serial already captured: download the
 ///   loader into RAM (flash untouched);
 /// - empty bus / Linux gadget: print the hint and wait for a download mode.
-pub fn bring_up(
+pub fn bring_up<B: Bus>(
+    bus: &mut B,
     config: &Config,
     loader: &LoaderContainer,
     wait: Option<Duration>,
     progress: ProgressFn,
-) -> Result<BroughtUp, BringUpError> {
+) -> Result<BroughtUp<B::T>, BringUpError> {
     let hint = &config.hint.text;
     let mut serial: Option<String> = None;
     // Set (with the refusal timestamp) once an unknown-identity persona
@@ -133,12 +202,12 @@ pub fn bring_up(
                 .into());
             }
         }
-        let mode = rockusb::current_mode()?;
+        let mode = bus.poll()?;
         let Some(mode) = mode else {
             if wait_loader.is_some() {
                 std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
             } else {
-                wait_download_mode(wait, hint)?;
+                bus.wait_download_mode(wait, hint)?;
             }
             continue;
         };
@@ -150,7 +219,7 @@ pub fn bring_up(
                 // will refuse our usbplug, and the reset itself would
                 // kick the running stock loader — keep it instead.
                 if serial.is_none() {
-                    serial = Some(read_loader_serial());
+                    serial = Some(normalize_serial(bus.loader_serial()));
                 }
                 if !is_identifying(serial.as_deref().unwrap_or("")) {
                     // The loader persona did not yield a real serial
@@ -163,38 +232,33 @@ pub fn bring_up(
                 }
                 let serial = serial.clone().unwrap();
                 if is_first_generation(&serial) {
-                    let session = attach_stock_loader(progress)?;
+                    let session = attach_stock_loader(bus, progress)?;
                     return Ok(BroughtUp {
                         session,
                         serial,
                         firstgen: true,
                     });
                 }
-                // sanity-check the pipe: a wedged loader endpoint fails
-                // every transfer and can only be fixed by re-entering
-                // the loader mode
-                {
-                    let mut probe = open_loader()?;
-                    if let Err(e) = probe.ready() {
-                        return Err(UsbError::WrongMode(format!(
-                            "лоадер (330d) не отвечает ({e}): передёрните \
-                             питание и войдите в режим лоадера заново"
-                        ))
-                        .into());
-                    }
-                }
+                // Sanity-check the pipe over one session and reset into
+                // MaskROM: a wedged loader endpoint fails every transfer
+                // and can only be fixed by re-entering the loader mode.
                 progress(Progress::Step("лоадер (330d): сбрасываю в MaskROM".into()));
-                {
-                    let mut s = open_loader()?;
-                    if let Err(e) = s.reset(RESET_SUBCODE_MASKROM) {
-                        return Err(UsbError::WrongMode(format!(
-                            "сброс в MaskROM отклонён ({e}): передёрните \
-                             питание и войдите в режим лоадера заново"
-                        ))
-                        .into());
-                    }
+                let mut s = bus.open_loader()?;
+                if let Err(e) = s.ready() {
+                    return Err(UsbError::WrongMode(format!(
+                        "лоадер (330d) не отвечает ({e}): передёрните \
+                         питание и войдите в режим лоадера заново"
+                    ))
+                    .into());
                 }
-                rockusb::monitor::wait_mode(rockusb::DeviceMode::MaskRom, Duration::from_secs(15))?;
+                if let Err(e) = s.reset(RESET_SUBCODE_MASKROM) {
+                    return Err(UsbError::WrongMode(format!(
+                        "сброс в MaskROM отклонён ({e}): передёрните \
+                         питание и войдите в режим лоадера заново"
+                    ))
+                    .into());
+                }
+                bus.wait_mode(rockusb::DeviceMode::MaskRom, Duration::from_secs(15))?;
             }
             rockusb::DeviceMode::MaskRom => {
                 // no serial read here: the identity is the loader serial
@@ -209,20 +273,18 @@ pub fn bring_up(
                     "MaskROM: загружаю лоадер в RAM (флеш не трогаю)".into(),
                 ));
                 {
-                    let mut m = MaskRomSession::new(open_maskrom()?);
+                    let mut m = MaskRomSession::new(bus.open_maskrom()?);
                     m.download(loader)?;
                 }
                 progress(Progress::Step("жду usbplug (до 20 с)".into()));
-                if rockusb::monitor::wait_mode(
-                    rockusb::DeviceMode::UsbPlug,
-                    Duration::from_secs(20),
-                )
-                .is_err()
+                if bus
+                    .wait_mode(rockusb::DeviceMode::UsbPlug, Duration::from_secs(20))
+                    .is_err()
                 {
                     progress(Progress::Step("usbplug не поднялся".into()));
                     return Err(BringUpError::LoaderRejected);
                 }
-                let mut s = open_loader()?;
+                let mut s = bus.open_loader()?;
                 verify_usbplug_signatures(&mut s, config, progress)?;
                 return Ok(BroughtUp {
                     session: s,
@@ -249,41 +311,22 @@ pub fn bring_up(
                     continue;
                 }
                 log::info!("режим {}, жду download-режим", other.label());
-                wait_download_mode(wait, hint)?;
+                bus.wait_download_mode(wait, hint)?;
             }
         }
     }
 }
 
-fn open_loader() -> rockusb::Result<LoaderSession<NusbTransport>> {
-    let t = NusbTransport::open(&rockusb::DeviceMode::Loader)
-        .or_else(|_| NusbTransport::open(&rockusb::DeviceMode::UsbPlug))?;
-    let (ep_in, ep_out) = (t.ep_in, t.ep_out);
-    Ok(LoaderSession::new(t, ep_in, ep_out))
-}
-
-/// The loader-persona serial, read and normalized exactly once. USB
-/// string descriptors can carry surrounding whitespace; both the
-/// firstgen classification and the backup directory key must see the
-/// same trimmed value.
-fn read_loader_serial() -> String {
-    rockusb::device_serial(&rockusb::DeviceMode::Loader)
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
-fn open_maskrom() -> rockusb::Result<NusbTransport> {
-    NusbTransport::open(&rockusb::DeviceMode::MaskRom)
-}
-
 /// Open and sanity-check the stock rockusb loader of a first-generation
 /// column (330d with a gift serial).
-pub fn attach_stock_loader(progress: ProgressFn) -> rockusb::Result<LoaderSession<NusbTransport>> {
+pub fn attach_stock_loader<B: Bus>(
+    bus: &mut B,
+    progress: ProgressFn,
+) -> rockusb::Result<LoaderSession<B::T>> {
     progress(Progress::Step(
         "первое поколение: работаю через стоковый лоадер (330d)".into(),
     ));
-    let mut s = open_loader()?;
+    let mut s = bus.open_loader()?;
     if let Err(e) = s.ready() {
         return Err(UsbError::WrongMode(format!(
             "стоковый лоадер (330d) не отвечает ({e}): передёрните питание \
@@ -324,14 +367,17 @@ pub fn verify_usbplug_signatures<T: Transport>(
 }
 
 /// Read and parse the on-device GPT (LBA1 + 33 sectors of entries).
+/// Returns the parsed table together with the raw sectors (the backup
+/// stores them as .gpt.bin).
 pub fn read_gpt<T: Transport>(
     s: &mut LoaderSession<T>,
     progress: ProgressFn,
-) -> rockusb::Result<crate::gpt::Gpt> {
+) -> rockusb::Result<(crate::gpt::Gpt, Vec<u8>)> {
     progress(Progress::Step("читаю GPT".into()));
     let mut buf = vec![0u8; 34 * 512];
     s.read_lba(1, &mut buf)?;
-    crate::gpt::Gpt::parse(&buf).map_err(|e| UsbError::Loader(format!("GPT: {e}")))
+    let gpt = crate::gpt::Gpt::parse(&buf).map_err(|e| UsbError::Loader(format!("GPT: {e}")))?;
+    Ok((gpt, buf))
 }
 
 #[cfg(test)]

@@ -35,8 +35,12 @@ pub const SOURCE_PATH: &str = "resources/config.toml";
 const EMBEDDED: &str = include_str!("../../../resources/config.toml");
 
 impl Config {
+    /// Parsed once per process (the CLI asks several times per run).
     pub fn embedded() -> Config {
-        toml::from_str(EMBEDDED).expect("resources/config.toml must parse")
+        static PARSED: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+        PARSED
+            .get_or_init(|| toml::from_str(EMBEDDED).expect("resources/config.toml must parse"))
+            .clone()
     }
 
     /// The embedded copy must stay in sync with the file in resources/.

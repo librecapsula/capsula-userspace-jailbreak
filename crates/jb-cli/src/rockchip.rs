@@ -196,7 +196,8 @@ fn dump_all_once(wait: Option<Duration>) -> anyhow::Result<Device> {
     let loader = jb_core::loader::embedded().context("не удалось разобрать вшитый лоадер")?;
     let p = CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
-    let up = match bring_up(&config, &loader, wait, &progress) {
+    let mut bus = jb_core::session::UsbBus;
+    let up = match bring_up(&mut bus, &config, &loader, wait, &progress) {
         Ok(v) => v,
         Err(BringUpError::LoaderRejected) => bail!(
             "usbplug не запустился: BootROM отклонил лоадер (неподдерживаемая \
@@ -268,7 +269,7 @@ fn write_userdata(
     // The GPT gives the partition size and the flash address on both
     // paths (the dump file is exactly the GPT sector count, so the
     // sizes agree).
-    let gpt =
+    let (gpt, _) =
         jb_core::session::read_gpt(s, &progress).context("не удалось прочитать GPT колонки")?;
     let part = gpt
         .find("userdata")

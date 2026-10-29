@@ -6,7 +6,6 @@
 //! from the repository root:
 //!   cargo run -p jb-core --example stock_diag --release
 
-use jb_core::gpt::Gpt;
 use rockusb::{DeviceMode, LoaderSession, NusbTransport};
 
 fn main() {
@@ -46,35 +45,28 @@ fn main() {
     println!("capability:      {:?}", s.capability());
 
     // ---- GPT: LBA1 + 33 entry sectors ----
-    let mut gpt_raw = vec![0u8; 34 * 512];
-    let gpt = match s.read_lba(1, &mut gpt_raw) {
-        Ok(()) => match Gpt::parse(&gpt_raw) {
-            Ok(g) => {
-                println!("GPT:             ok, {} partitions", g.entries.len());
-                for e in &g.entries {
-                    println!(
-                        "  #{:<2} {:>10}  LBA {:>7}..{:<7} {:>7} sectors  {:>6} MiB",
-                        e.idx,
-                        e.name,
-                        e.first_lba,
-                        e.last_lba,
-                        e.sectors,
-                        e.sectors * 512 / 1024 / 1024
-                    );
-                }
-                if std::fs::create_dir_all("work").is_ok() {
-                    let _ = std::fs::write("work/stock_gpt.bin", &gpt_raw);
-                    println!("  (raw sectors saved to work/stock_gpt.bin)");
-                }
-                Some(g)
+    let gpt = match jb_core::session::read_gpt(&mut s, &|_| {}) {
+        Ok((g, raw)) => {
+            println!("GPT:             ok, {} partitions", g.entries.len());
+            for e in &g.entries {
+                println!(
+                    "  #{:<2} {:>10}  LBA {:>7}..{:<7} {:>7} sectors  {:>6} MiB",
+                    e.idx,
+                    e.name,
+                    e.first_lba,
+                    e.last_lba,
+                    e.sectors,
+                    e.sectors * 512 / 1024 / 1024
+                );
             }
-            Err(e) => {
-                println!("GPT:             parse error: {e}");
-                None
+            if std::fs::create_dir_all("work").is_ok() {
+                let _ = std::fs::write("work/stock_gpt.bin", &raw);
+                println!("  (raw sectors saved to work/stock_gpt.bin)");
             }
-        },
+            Some(g)
+        }
         Err(e) => {
-            println!("GPT:             read error: {e}");
+            println!("GPT:             read/parse error: {e}");
             None
         }
     };
