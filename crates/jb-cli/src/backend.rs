@@ -34,7 +34,4 @@ pub trait Backend {
 
     /// Только дамп: на устройство не пишется.
     fn backup(&mut self, wait: Option<Duration>) -> anyhow::Result<()>;
-
-    /// Живой лог событий шины этой платформы.
-    fn monitor(&mut self) -> anyhow::Result<()>;
 }

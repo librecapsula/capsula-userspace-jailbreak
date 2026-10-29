@@ -19,9 +19,21 @@ pub enum MonitorEvent {
     Disappeared(DeviceMode),
 }
 
+/// One bus snapshot. A transient enumeration failure (a devnode being
+/// rebound on Windows) must not abort whatever is waiting on the bus —
+/// log it and report an empty snapshot.
+fn bus_modes() -> Vec<DeviceMode> {
+    match list_modes() {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("перечисление USB не удалось ({e}) — попробую снова");
+            Vec::new()
+        }
+    }
+}
+
 /// Diffing monitor: poll() compares the current bus state with the
-/// previous one and reports appear/disappear events (with logging, like
-/// _usblog).
+/// previous one and reports appear/disappear events.
 #[derive(Debug, Default)]
 pub struct DeviceMonitor {
     last: Vec<DeviceMode>,
@@ -35,7 +47,7 @@ impl DeviceMonitor {
 
     /// One bus poll; events are logged and returned.
     pub fn poll(&mut self) -> Result<Vec<MonitorEvent>> {
-        let cur = list_modes()?;
+        let cur = bus_modes();
         let mut events = Vec::new();
         if !self.started {
             // whatever is present at start is not an event (as in v1)
@@ -80,7 +92,7 @@ pub fn wait_download_mode(timeout: Option<Duration>, hint: &str) -> Result<Devic
             ) {
                 // the window can be short: make sure it persists
                 std::thread::sleep(DEBOUNCE);
-                let now = crate::transport::current_mode()?;
+                let now = DeviceMode::best(&bus_modes());
                 if matches!(
                     now,
                     Some(DeviceMode::Loader | DeviceMode::UsbPlug | DeviceMode::MaskRom)
@@ -111,7 +123,7 @@ pub fn wait_download_mode(timeout: Option<Duration>, hint: &str) -> Result<Devic
 pub fn wait_mode(mode: DeviceMode, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     loop {
-        if list_modes()?.contains(&mode) {
+        if bus_modes().contains(&mode) {
             return Ok(());
         }
         if start.elapsed() >= timeout {
@@ -130,7 +142,7 @@ pub fn wait_gadget_stable(stable: Duration, timeout: Option<Duration>) -> Result
     let start = Instant::now();
     let mut seen_since: Option<Instant> = None;
     loop {
-        let present = list_modes()?.contains(&DeviceMode::LinuxGadget);
+        let present = bus_modes().contains(&DeviceMode::LinuxGadget);
         match (present, seen_since) {
             (true, Some(t0)) if t0.elapsed() >= stable => {
                 log::info!("gadget 0006 stable for {:?}", t0.elapsed());

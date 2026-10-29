@@ -23,8 +23,8 @@
 main (jb-cli) — только входная точка: разбор аргументов и выбор
 платформенного бэкенда **по USB-устройству на шине** (`pick_backend`:
 платформы различаются по VID:PID, опрос — через `Backend::present`).
-Контракт — `jb-cli/src/backend.rs` (`jailbreak` / `backup` / `monitor`
-/ `present` / `wait_hint`); реализация rockchip — `jb-cli/src/rockchip.rs`
+Контракт — `jb-cli/src/backend.rs` (`jailbreak` / `backup` / `present`
+/ `wait_hint`); реализация rockchip — `jb-cli/src/rockchip.rs`
 (весь сценарий, WinUSB-драйверы win-drv, монитор шины), домен — jb-core.
 Будущая платформа = новый модуль-бэкенд в jb-cli по контракту + строка
 в `main::backends()`; rockchip-модуль при этом трогать не нужно.

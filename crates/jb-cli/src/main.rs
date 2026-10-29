@@ -15,8 +15,6 @@ use anyhow::bail;
 use clap::{Parser, Subcommand};
 use std::time::{Duration, Instant};
 
-use crate::backend::Backend;
-
 #[derive(Parser)]
 #[command(
     name = "capsula-jb",
@@ -65,9 +63,9 @@ fn main() -> anyhow::Result<()> {
     let result = match cli.command {
         None => pick_backend(wait)?.jailbreak(cli.yes, cli.format_userdata, wait),
         Some(Command::Backup) => pick_backend(wait)?.backup(wait),
-        // Монитор не ждёт устройства. Шина сегодня одна — rockchip;
-        // с появлением второй платформы здесь появится объединение.
-        Some(Command::Monitor) => rockchip::Rockchip::new().monitor(),
+        // Монитор не ждёт устройства и не строит драйверную сессию —
+        // только живой лог шины.
+        Some(Command::Monitor) => rockchip::monitor_bus(),
     };
     // Launched from a normal console, Windows elevates the tool into a
     // NEW console window (see the UAC manifest note in .cargo/config.toml);

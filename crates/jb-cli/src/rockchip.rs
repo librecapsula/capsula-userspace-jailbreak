@@ -67,7 +67,15 @@ impl Backend for Rockchip {
     }
 
     fn present(&self) -> anyhow::Result<bool> {
-        Ok(rockusb::current_mode()?.is_some())
+        match rockusb::current_mode() {
+            Ok(m) => Ok(m.is_some()),
+            // a transient enumeration failure (a devnode mid-rebind on
+            // Windows) must not abort the wait — report "not present"
+            Err(e) => {
+                log::warn!("перечисление USB не удалось ({e}) — попробую снова");
+                Ok(false)
+            }
+        }
     }
 
     fn wait_hint(&self) -> Option<&str> {
@@ -80,12 +88,12 @@ impl Backend for Rockchip {
         format_userdata: bool,
         wait: Option<Duration>,
     ) -> anyhow::Result<()> {
-        let mut dev = dump_all(wait, &mut self.drivers)?;
+        let mut dev = dump_all(wait, &self.config, &mut self.drivers)?;
         write_userdata(&mut dev, yes, format_userdata, wait)
     }
 
     fn backup(&mut self, wait: Option<Duration>) -> anyhow::Result<()> {
-        let dev = dump_all(wait, &mut self.drivers)?;
+        let dev = dump_all(wait, &self.config, &mut self.drivers)?;
         if dev.firstgen {
             bail!(
                 "первое поколение: полный дамп невозможен (BootROM залочен). \
@@ -108,10 +116,6 @@ impl Backend for Rockchip {
         }
         Ok(())
     }
-
-    fn monitor(&mut self) -> anyhow::Result<()> {
-        monitor()
-    }
 }
 
 /// Backup directory for a column: backup/<sanitized serial>.
@@ -128,7 +132,11 @@ fn backup_dir(serial: &str) -> PathBuf {
 /// Rockusb driver before our WinUSB package gets it; when that
 /// happens the session rebinds the node and the bring-up — which is a
 /// re-entrant state machine over the current bus state — is retried.
-fn dump_all(wait: Option<Duration>, drivers: &mut win_drv::Session) -> anyhow::Result<Device> {
+fn dump_all(
+    wait: Option<Duration>,
+    config: &Config,
+    drivers: &mut win_drv::Session,
+) -> anyhow::Result<Device> {
     if win_drv::any_rockchip_node_misbound() {
         println!("устройство Rockchip без WinUSB — ставлю драйвер");
         start_or_wait_drivers(drivers, Duration::from_secs(180));
@@ -136,17 +144,18 @@ fn dump_all(wait: Option<Duration>, drivers: &mut win_drv::Session) -> anyhow::R
 
     const ATTEMPTS: u32 = 5;
     for attempt in 1..=ATTEMPTS {
-        match dump_all_once(wait) {
+        match dump_all_once(wait, config) {
             Ok(s) => return Ok(s),
             Err(e) => {
-                if attempt < ATTEMPTS && win_drv::chain_is_binding_error(&e) {
+                let binding_error = win_drv::chain_is_binding_error(&e);
+                if binding_error && attempt < ATTEMPTS {
                     println!(
                         "узел перехвачен чужим драйвером (попытка {attempt}/{ATTEMPTS}) — перевязываю"
                     );
                     start_or_wait_drivers(drivers, Duration::from_secs(120));
                     continue;
                 }
-                if win_drv::chain_is_binding_error(&e) {
+                if binding_error {
                     // the driver supervisor could not win in ATTEMPTS tries
                     return Err(e.context(format!(
                         "драйвер WinUSB не установился; лог: {}\n\
@@ -158,7 +167,7 @@ fn dump_all(wait: Option<Duration>, drivers: &mut win_drv::Session) -> anyhow::R
             }
         }
     }
-    unreachable!("the retry loop always returns")
+    Err(anyhow::anyhow!("перебор попыток перевязки драйвера"))
 }
 
 /// Make sure the driver supervisor is running, then wait for the board
@@ -191,13 +200,12 @@ fn start_or_wait_drivers(drivers: &mut win_drv::Session, settle: Duration) {
 /// One bring-up + dump attempt (no retries). The first-generation
 /// classification lives in bring_up (jb-core): the returned `firstgen`
 /// flag drives everything downstream.
-fn dump_all_once(wait: Option<Duration>) -> anyhow::Result<Device> {
-    let config = Config::embedded();
+fn dump_all_once(wait: Option<Duration>, config: &Config) -> anyhow::Result<Device> {
     let loader = jb_core::loader::embedded().context("не удалось разобрать вшитый лоадер")?;
     let p = CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
     let mut bus = jb_core::session::UsbBus;
-    let up = match bring_up(&mut bus, &config, &loader, wait, &progress) {
+    let up = match bring_up(&mut bus, config, &loader, wait, &progress) {
         Ok(v) => v,
         Err(BringUpError::LoaderRejected) => bail!(
             "usbplug не запустился: BootROM отклонил лоадер (неподдерживаемая \
@@ -232,7 +240,7 @@ fn dump_all_once(wait: Option<Duration>) -> anyhow::Result<Device> {
         );
         false
     } else {
-        backup::backup(&mut s, &config, &dir, &progress)
+        backup::backup(&mut s, config, &dir, &progress)
             .with_context(|| format!("колонка {serial}: полный дамп"))?;
         let _ = std::fs::write(dir.join("serial.txt"), &serial);
         true
@@ -256,7 +264,6 @@ fn write_userdata(
     format_userdata: bool,
     wait: Option<Duration>,
 ) -> anyhow::Result<()> {
-    let s = &mut dev.session;
     if dev.firstgen {
         println!(
             "первое поколение {} (стоковый лоадер): полный бэкап НЕВОЗМОЖЕН.",
@@ -269,8 +276,8 @@ fn write_userdata(
     // The GPT gives the partition size and the flash address on both
     // paths (the dump file is exactly the GPT sector count, so the
     // sizes agree).
-    let (gpt, _) =
-        jb_core::session::read_gpt(s, &progress).context("не удалось прочитать GPT колонки")?;
+    let (gpt, _) = jb_core::session::read_gpt(&mut dev.session, &progress)
+        .context("не удалось прочитать GPT колонки")?;
     let part = gpt
         .find("userdata")
         .context("в GPT колонки нет раздела userdata")?;
@@ -279,40 +286,9 @@ fn write_userdata(
         println!("раздел userdata: {} (из GPT колонки)", humansize(part_size));
     }
 
-    // step 4: the image base — the dump from backup/ (regular column),
-    // or nothing when building from scratch.
     let fresh = dev.firstgen || format_userdata;
-    let dump = if fresh {
-        None
-    } else {
-        // dump_all has just taken or verified this backup; re-check it
-        // so a broken dump never becomes the base of the only copy.
-        let store = BackupStore::open(&backup_dir(&dev.serial))
-            .context("нет валидного бэкапа этой колонки — запустите инструмент ещё раз")?;
-        store
-            .verify()
-            .context("бэкап не прошёл проверку SHA256 — снимите дамп заново")?;
-        Some(
-            store
-                .find("userdata")
-                .context("в бэкапе нет раздела userdata")?
-                .to_path_buf(),
-        )
-    };
-
-    if !yes {
-        let mode = if dev.firstgen {
-            "оверлей adbd на чистый ext2 — бэкапа на первом поколении нет, \
-             текущее содержимое теряется"
-        } else if fresh {
-            "оверлей adbd на чистый ext2 (--format-userdata, содержимое теряется)"
-        } else {
-            "оверлей adbd поверх дампа, содержимое сохраняется"
-        };
-        println!("запись userdata ({}): {mode}", humansize(part_size));
-        print!("продолжить? [y/N] ");
-        crate::ask_yes()?;
-    }
+    let dump = image_base(dev, fresh)?;
+    confirm_write(dev.firstgen, fresh, yes, part_size)?;
 
     let marker = format!("capsula-jb userspace {}\n", utc_now_iso());
     let out = PathBuf::from("work").join("userdata.img");
@@ -327,11 +303,51 @@ fn write_userdata(
     .context("не удалось собрать образ userdata с оверлеем")?;
 
     // step 5: flash the partition (the same session, ours or stock)
-    flash::write_partition_padded(s, &gpt, "userdata", &out, &progress)
+    flash::write_partition_padded(&mut dev.session, &gpt, "userdata", &out, &progress)
         .with_context(|| format!("колонка {}: запись userdata", dev.serial))?;
 
     // step 6: reboot and wait for the ADB gadget
-    reboot_and_wait(s, wait)
+    reboot_and_wait(&mut dev.session, wait)
+}
+
+/// The base of the new userdata image: the verified dump of this column
+/// (regular path), or nothing when building from scratch. Re-opens and
+/// re-verifies the backup so a broken dump never becomes the base of
+/// the only copy.
+fn image_base(dev: &Device, fresh: bool) -> anyhow::Result<Option<PathBuf>> {
+    if fresh {
+        return Ok(None);
+    }
+    let store = BackupStore::open(&backup_dir(&dev.serial))
+        .context("нет валидного бэкапа этой колонки — запустите инструмент ещё раз")?;
+    store
+        .verify()
+        .context("бэкап не прошёл проверку SHA256 — снимите дамп заново")?;
+    Ok(Some(
+        store
+            .find("userdata")
+            .context("в бэкапе нет раздела userdata")?
+            .to_path_buf(),
+    ))
+}
+
+/// Ask for the write confirmation (skipped with --yes). Nothing has
+/// been written at this point, so a refusal is safe.
+fn confirm_write(firstgen: bool, fresh: bool, yes: bool, part_size: u64) -> anyhow::Result<()> {
+    if yes {
+        return Ok(());
+    }
+    let mode = if firstgen {
+        "оверлей adbd на чистый ext2 — бэкапа на первом поколении нет, \
+         текущее содержимое теряется"
+    } else if fresh {
+        "оверлей adbd на чистый ext2 (--format-userdata, содержимое теряется)"
+    } else {
+        "оверлей adbd поверх дампа, содержимое сохраняется"
+    };
+    println!("запись userdata ({}): {mode}", humansize(part_size));
+    print!("продолжить? [y/N] ");
+    crate::ask_yes()
 }
 
 /// The shared tail of every flow: reboot the device and wait for the ADB
@@ -363,7 +379,7 @@ fn print_step(ev: Progress) {
 }
 
 /// Live log of 2207:* bus events.
-fn monitor() -> anyhow::Result<()> {
+pub(crate) fn monitor_bus() -> anyhow::Result<()> {
     let mut m = rockusb::DeviceMonitor::new();
     println!("Монитор USB 2207:* (Ctrl-C — выход).");
     m.poll()?;
