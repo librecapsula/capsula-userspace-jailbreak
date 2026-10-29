@@ -13,10 +13,7 @@
 
 /// Is this USB serial a first-generation column?
 pub fn is_first_generation(serial: &str) -> bool {
-    !serial
-        .chars()
-        .take(4)
-        .all(|c| c.is_ascii_digit())
+    !serial.chars().take(4).all(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]

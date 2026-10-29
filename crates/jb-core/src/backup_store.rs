@@ -137,9 +137,7 @@ impl BackupStore {
                 .ok_or_else(|| StoreError::Checksum(format!("битая строка: {line}")))?;
             let f = self.dir.join(name);
             if !f.is_file() {
-                return Err(StoreError::Checksum(format!(
-                    "нет файла из сумм: {name}"
-                )));
+                return Err(StoreError::Checksum(format!("нет файла из сумм: {name}")));
             }
             let got = file_sha256(&f)?;
             if got != hexpart.to_lowercase() {
@@ -195,8 +193,14 @@ mod tests {
 
     #[test]
     fn dir_name_sanitizes_serials() {
-        assert_eq!(BackupStore::dir_name("01139EB3613ABD80"), "01139EB3613ABD80");
-        assert_eq!(BackupStore::dir_name("e5fe5a07c23ce39a"), "e5fe5a07c23ce39a");
+        assert_eq!(
+            BackupStore::dir_name("01139EB3613ABD80"),
+            "01139EB3613ABD80"
+        );
+        assert_eq!(
+            BackupStore::dir_name("e5fe5a07c23ce39a"),
+            "e5fe5a07c23ce39a"
+        );
         assert_eq!(BackupStore::dir_name("../evil/serial"), ".._evil_serial");
         assert_eq!(BackupStore::dir_name("  "), "unknown");
         assert_eq!(BackupStore::dir_name(""), "unknown");

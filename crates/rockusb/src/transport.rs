@@ -252,8 +252,7 @@ pub fn find_device(mode: &DeviceMode) -> Option<nusb::DeviceInfo> {
 /// (the chip UID prefix); first-generation units carry random-looking
 /// hex — see `jb_core::firstgen`.
 pub fn device_serial(mode: &DeviceMode) -> Option<String> {
-    find_device(mode)
-        .and_then(|d| d.serial_number().map(|s| s.to_string()))
+    find_device(mode).and_then(|d| d.serial_number().map(|s| s.to_string()))
 }
 
 /// All Rockchip modes currently on the bus (deduplicated). The fastboot

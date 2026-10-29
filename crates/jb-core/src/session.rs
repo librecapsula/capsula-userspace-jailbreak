@@ -78,11 +78,7 @@ pub fn is_identifying(serial: &str) -> bool {
 /// only way forward is re-entry through the loader persona (330d), the
 /// only one that reports the identity. Idempotent (prints once);
 /// records when the wait started for the `wait` deadline.
-fn refuse_unknown_identity(
-    wait_loader: &mut Option<Instant>,
-    progress: ProgressFn,
-    hint: &str,
-) {
+fn refuse_unknown_identity(wait_loader: &mut Option<Instant>, progress: ProgressFn, hint: &str) {
     if wait_loader.is_some() {
         return;
     }
@@ -90,7 +86,8 @@ fn refuse_unknown_identity(
     progress(Progress::Step(
         "серийник колонки неизвестен: перезапустите её в режим лоадера \
          (выключить питание, зажать Recovery, включить) — без серийника \
-         инструмент не может выбрать путь".into(),
+         инструмент не может выбрать путь"
+            .into(),
     ));
     if !hint.is_empty() {
         println!("{hint}");
@@ -157,8 +154,7 @@ pub fn bring_up(
                 // kick the running stock loader — keep it instead.
                 if serial.is_none() {
                     serial = Some(
-                        rockusb::device_serial(&rockusb::DeviceMode::Loader)
-                            .unwrap_or_default(),
+                        rockusb::device_serial(&rockusb::DeviceMode::Loader).unwrap_or_default(),
                     );
                 }
                 if !is_identifying(serial.as_deref().unwrap_or("")) {
@@ -173,7 +169,11 @@ pub fn bring_up(
                 let serial = serial.clone().unwrap();
                 if is_first_generation(&serial) {
                     let session = attach_stock_loader(progress)?;
-                    return Ok(BroughtUp { session, serial, firstgen: true });
+                    return Ok(BroughtUp {
+                        session,
+                        serial,
+                        firstgen: true,
+                    });
                 }
                 // sanity-check the pipe: a wedged loader endpoint fails
                 // every transfer and can only be fixed by re-entering
@@ -264,10 +264,7 @@ pub fn bring_up(
                     std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
                     continue;
                 }
-                log::info!(
-                    "режим {}, жду download-режим",
-                    other.label()
-                );
+                log::info!("режим {}, жду download-режим", other.label());
                 wait_download_mode(wait, hint)?;
             }
         }
@@ -287,9 +284,7 @@ fn open_maskrom() -> rockusb::Result<NusbTransport> {
 
 /// Open and sanity-check the stock rockusb loader of a first-generation
 /// column (330d with a gift serial).
-pub fn attach_stock_loader(
-    progress: ProgressFn,
-) -> rockusb::Result<LoaderSession<NusbTransport>> {
+pub fn attach_stock_loader(progress: ProgressFn) -> rockusb::Result<LoaderSession<NusbTransport>> {
     progress(Progress::Step(
         "первое поколение: работаю через стоковый лоадер (330d)".into(),
     ));

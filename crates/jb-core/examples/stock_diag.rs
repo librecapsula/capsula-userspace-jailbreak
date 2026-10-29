@@ -83,7 +83,9 @@ fn main() {
     // (our usbplug masks everything above 0x10000 sectors as 0xCC; the
     // stock u-boot rockusb may not have that protection at all)
     println!("read probes (512 B each):");
-    for lba in [0x1000u32, 0x8000, 0xFFF0, 0x10000, 0x10001, 0x20000, 0x40000] {
+    for lba in [
+        0x1000u32, 0x8000, 0xFFF0, 0x10000, 0x10001, 0x20000, 0x40000,
+    ] {
         let mut buf = vec![0xccu8; 512];
         match s.read_lba(lba, &mut buf) {
             Ok(()) => println!(
@@ -120,7 +122,11 @@ fn main() {
                     println!(
                         "userdata head:   ext2 magic {:#06x} ({})",
                         magic,
-                        if magic == 0xef53 { "formatted" } else { "NOT ext" }
+                        if magic == 0xef53 {
+                            "formatted"
+                        } else {
+                            "NOT ext"
+                        }
                     );
                     if magic == 0xef53 {
                         let blocks = u32::from_le_bytes(sb[4..8].try_into().unwrap());

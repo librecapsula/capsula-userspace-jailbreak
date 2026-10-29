@@ -177,7 +177,11 @@ fn mkdir_all(fs: &Ext4Fs, dir: &Path) -> Result<(), UserDataError> {
         let comp = match comp {
             Component::RootDir | Component::Prefix(_) => continue,
             Component::Normal(c) => c.to_string_lossy().into_owned(),
-            other => return Err(UserDataError::NotExt(format!("неожидаемый путь: {other:?}"))),
+            other => {
+                return Err(UserDataError::NotExt(format!(
+                    "неожидаемый путь: {other:?}"
+                )))
+            }
         };
         cur.push('/');
         cur.push_str(&comp);

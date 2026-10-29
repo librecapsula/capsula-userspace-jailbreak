@@ -129,10 +129,7 @@ fn backup_dir(serial: &str) -> PathBuf {
 /// Rockusb driver before our WinUSB package gets it; when that
 /// happens the session rebinds the node and the bring-up — which is a
 /// re-entrant state machine over the current bus state — is retried.
-fn dump_all(
-    wait: Option<Duration>,
-    drivers: &mut win_drv::Session,
-) -> anyhow::Result<Device> {
+fn dump_all(wait: Option<Duration>, drivers: &mut win_drv::Session) -> anyhow::Result<Device> {
     if win_drv::any_rockchip_node_misbound() {
         println!("устройство Rockchip без WinUSB — ставлю драйвер");
         start_or_wait_drivers(drivers, Duration::from_secs(180));
@@ -197,8 +194,7 @@ fn start_or_wait_drivers(drivers: &mut win_drv::Session, settle: Duration) {
 /// flag drives everything downstream.
 fn dump_all_once(wait: Option<Duration>) -> anyhow::Result<Device> {
     let config = Config::embedded();
-    let loader =
-        jb_core::loader::embedded().context("не удалось разобрать вшитый лоадер")?;
+    let loader = jb_core::loader::embedded().context("не удалось разобрать вшитый лоадер")?;
     let p = CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
     let up = match bring_up(&config, &loader, wait, &progress) {
@@ -272,8 +268,8 @@ fn write_userdata(
     // The GPT gives the partition size and the flash address on both
     // paths (the dump file is exactly the GPT sector count, so the
     // sizes agree).
-    let gpt = jb_core::session::read_gpt(s, &progress)
-        .context("не удалось прочитать GPT колонки")?;
+    let gpt =
+        jb_core::session::read_gpt(s, &progress).context("не удалось прочитать GPT колонки")?;
     let part = gpt
         .find("userdata")
         .context("в GPT колонки нет раздела userdata")?;
@@ -338,7 +334,10 @@ fn write_userdata(
 
 /// The shared tail of every flow: reboot the device and wait for the ADB
 /// gadget to come up and stay.
-fn reboot_and_wait(s: &mut rockusb::LoaderSession<NusbTransport>, wait: Option<Duration>) -> anyhow::Result<()> {
+fn reboot_and_wait(
+    s: &mut rockusb::LoaderSession<NusbTransport>,
+    wait: Option<Duration>,
+) -> anyhow::Result<()> {
     println!("перезагружаю колонку...");
     let _ = s.reset(RESET_SUBCODE_NORMAL);
     wait_for_adb_gadget(wait)
@@ -349,9 +348,8 @@ fn wait_for_adb_gadget(wait: Option<Duration>) -> anyhow::Result<()> {
         "жду ADB-гаджет (2207:0006; должен продержаться {} с)...",
         GADGET_STABLE.as_secs()
     );
-    rockusb::monitor::wait_gadget_stable(GADGET_STABLE, wait).context(
-        "ADB-гаджет не поднялся (или мигнул и пропал) — проверьте загрузку колонки",
-    )?;
+    rockusb::monitor::wait_gadget_stable(GADGET_STABLE, wait)
+        .context("ADB-гаджет не поднялся (или мигнул и пропал) — проверьте загрузку колонки")?;
     println!("готово: ADB поднят — adb shell даёт root без авторизации");
     Ok(())
 }

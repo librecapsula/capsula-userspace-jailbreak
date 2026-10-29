@@ -33,7 +33,9 @@ pub use loader::LoaderSession;
 pub use loader_container::LoaderContainer;
 pub use maskrom::MaskRomSession;
 pub use monitor::DeviceMonitor;
-pub use transport::{current_mode, device_serial, list_modes, DeviceMode, NusbTransport, Transport};
+pub use transport::{
+    current_mode, device_serial, list_modes, DeviceMode, NusbTransport, Transport,
+};
 
 /// USB VID of all Rockchip modes.
 pub const USB_VID_ROCKCHIP: u16 = 0x2207;
