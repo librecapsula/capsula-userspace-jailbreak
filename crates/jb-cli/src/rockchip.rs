@@ -231,7 +231,8 @@ fn dump_all_once(wait: Option<Duration>) -> anyhow::Result<Device> {
         );
         false
     } else {
-        backup::backup(&mut s, &config, &dir, &progress)?;
+        backup::backup(&mut s, &config, &dir, &progress)
+            .with_context(|| format!("колонка {serial}: полный дамп"))?;
         let _ = std::fs::write(dir.join("serial.txt"), &serial);
         true
     };
@@ -325,7 +326,8 @@ fn write_userdata(
     .context("не удалось собрать образ userdata с оверлеем")?;
 
     // step 5: flash the partition (the same session, ours or stock)
-    flash::write_partition_padded(s, &gpt, "userdata", &out, &progress)?;
+    flash::write_partition_padded(s, &gpt, "userdata", &out, &progress)
+        .with_context(|| format!("колонка {}: запись userdata", dev.serial))?;
 
     // step 6: reboot and wait for the ADB gadget
     reboot_and_wait(s, wait)

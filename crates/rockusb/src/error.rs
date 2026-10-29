@@ -22,6 +22,17 @@ pub enum Error {
     /// The device is in the wrong mode for this operation.
     #[error("wrong device mode: {0}")]
     WrongMode(String),
+    /// A bulk transfer got no answer within the timeout — the device
+    /// stopped responding (a wedged loader). Carries the details needed
+    /// to analyze the hang: what was being transferred, on which
+    /// endpoint, and for how long there was no answer.
+    #[error("{what}: нет ответа от устройства за {waited:?} (ep {endpoint:#x}, {len} байт) — похоже, завис лоадер")]
+    Timeout {
+        what: String,
+        endpoint: u8,
+        len: usize,
+        waited: std::time::Duration,
+    },
     /// I/O error (loader files etc.).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

@@ -88,6 +88,18 @@ impl<T: Transport> LoaderSession<T> {
         self.tag.to_be_bytes()
     }
 
+    /// Attach the running command to a transfer timeout so a wedged-device
+    /// report says WHAT stalled (opcode, address, length).
+    fn annotate_cmd(mut e: crate::error::Error, cmd: &RawCommand) -> crate::error::Error {
+        if let crate::error::Error::Timeout { what, .. } = &mut e {
+            what.push_str(&format!(
+                " в команде {:#04x} addr {:#010x} len {}",
+                cmd.opcode, cmd.address, cmd.length
+            ));
+        }
+        e
+    }
+
     /// Send the CBW, run the data phase (read into buf / write payload),
     /// verify the CSW (signature, tag, status).
     fn exec(
@@ -109,14 +121,20 @@ impl<T: Transport> LoaderSession<T> {
         // usb_command_t: address(2..6), reserved6(6), size(7..9) -> CBW 22..24
         cbw[22..24].copy_from_slice(&cmd.size.to_be_bytes());
 
-        self.transport.bulk_write(self.ep_out, &cbw)?;
+        self.transport
+            .bulk_write(self.ep_out, &cbw)
+            .map_err(|e| Self::annotate_cmd(e, cmd))?;
         if let Some(data) = payload_out {
-            self.transport.bulk_write(self.ep_out, data)?;
+            self.transport
+                .bulk_write(self.ep_out, data)
+                .map_err(|e| Self::annotate_cmd(e, cmd))?;
         }
         if let Some(buf) = buf_in {
-            self.transport.bulk_read(self.ep_in, buf)?;
+            self.transport
+                .bulk_read(self.ep_in, buf)
+                .map_err(|e| Self::annotate_cmd(e, cmd))?;
         }
-        self.read_csw(&tag)
+        self.read_csw(&tag).map_err(|e| Self::annotate_cmd(e, cmd))
     }
 
     fn read_csw(&mut self, tag: &[u8; 4]) -> Result<()> {

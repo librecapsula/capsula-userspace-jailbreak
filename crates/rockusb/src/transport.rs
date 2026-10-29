@@ -3,9 +3,8 @@
 
 use crate::error::{Error, Result};
 use nusb::descriptors::TransferType;
-use nusb::transfer::{ControlOut, ControlType, Direction, Recipient};
+use nusb::transfer::{Buffer, ControlOut, ControlType, Direction, Recipient, TransferError};
 use nusb::MaybeFuture;
-use std::io::{Read as _, Write as _};
 
 /// Snapshot of a Rockchip device present on the bus.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -97,6 +96,14 @@ pub trait Transport {
 
 /// Timeout for control transfers.
 const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Timeout for ONE bulk transfer request (a single chunk). A wedged
+/// device — no packets at all, e.g. the BootROM silently dropped our
+/// loader, or the loader died mid-command — would otherwise hang the
+/// tool forever, including in the middle of a userdata write. 10 s is
+/// far above any legitimate NAND-paced chunk (a healthy dump streams
+/// packets continuously); hitting it means the device stopped answering.
+const BULK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Transport over nusb (blocking IO via the MaybeFuture/EndpointRead/
 /// EndpointWrite adapters).
@@ -194,32 +201,58 @@ impl Transport for NusbTransport {
     }
 
     fn bulk_write(&mut self, endpoint: u8, data: &[u8]) -> Result<()> {
-        let ep = self
+        let mut ep = self
             .interface
             .endpoint::<nusb::transfer::Bulk, nusb::transfer::Out>(endpoint)
             .map_err(|e| Error::Usb(e.to_string()))?;
-        let mut writer = ep.writer(data.len().max(512));
-        writer
-            .write_all(data)
-            .map_err(|e| Error::Usb(e.to_string()))?;
-        // EndpointWrite buffers until full: without an explicit flush a
-        // short write (the 31-byte CBW) is never submitted.
-        writer.flush().map_err(|e| Error::Usb(e.to_string()))?;
-        Ok(())
+        let completion = ep.transfer_blocking(Buffer::from(data), BULK_TIMEOUT);
+        completion
+            .status
+            .map_err(|e| bulk_error("bulk-OUT", endpoint, data.len(), e))
     }
 
     fn bulk_read(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<()> {
-        for chunk in buf.chunks_mut(BULK_IN_MAX) {
-            let ep = self
-                .interface
-                .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
-                .map_err(|e| Error::Usb(e.to_string()))?;
-            let mut reader = ep.reader(chunk.len().max(512));
-            reader
-                .read_exact(chunk)
-                .map_err(|e| Error::Usb(e.to_string()))?;
+        let mut ep = self
+            .interface
+            .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
+            .map_err(|e| Error::Usb(e.to_string()))?;
+        // An IN request length must be a multiple of the endpoint's max
+        // packet size; round up — a short packet (the 13-byte CSW) ends
+        // the transfer early, so this stays protocol-transparent.
+        let mps = ep.max_packet_size().max(1);
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let want = ((buf.len() - filled).div_ceil(mps) * mps).min(BULK_IN_MAX);
+            let completion = ep.transfer_blocking(Buffer::new(want), BULK_TIMEOUT);
+            let n = completion.actual_len;
+            completion
+                .status
+                .map_err(|e| bulk_error("bulk-IN", endpoint, want, e))?;
+            if n > buf.len() - filled {
+                return Err(Error::Usb(format!(
+                    "bulk-IN ep {endpoint:#x}: устройство прислало больше запрошенного"
+                )));
+            }
+            buf[filled..filled + n].copy_from_slice(&completion.buffer[..n]);
+            filled += n;
         }
         Ok(())
+    }
+}
+
+/// Map a failed bulk transfer. `transfer_blocking` reports its own
+/// timeout as `Cancelled`, which for us can only mean "no answer within
+/// BULK_TIMEOUT" — turn that into the analyzable Timeout error.
+fn bulk_error(what: &'static str, endpoint: u8, len: usize, e: TransferError) -> Error {
+    if matches!(e, TransferError::Cancelled) {
+        Error::Timeout {
+            what: what.into(),
+            endpoint,
+            len,
+            waited: BULK_TIMEOUT,
+        }
+    } else {
+        Error::Usb(e.to_string())
     }
 }
 
@@ -266,4 +299,37 @@ pub fn list_modes() -> Result<Vec<DeviceMode>> {
 /// The best mode present right now (see [`DeviceMode::best`]).
 pub fn current_mode() -> Result<Option<DeviceMode>> {
     Ok(DeviceMode::best(&list_modes()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_maps_to_timeout_with_details() {
+        // transfer_blocking reports its own timeout as Cancelled — the
+        // only way we can see one — and the error must carry the
+        // transfer details for hang analysis
+        let e = bulk_error("bulk-IN", 0x81, 1024, TransferError::Cancelled);
+        match e {
+            Error::Timeout {
+                what,
+                endpoint,
+                len,
+                waited,
+            } => {
+                assert_eq!(what, "bulk-IN");
+                assert_eq!(endpoint, 0x81);
+                assert_eq!(len, 1024);
+                assert_eq!(waited, BULK_TIMEOUT);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_transfer_errors_stay_usb() {
+        let e = bulk_error("bulk-OUT", 2, 31, TransferError::Stall);
+        assert!(matches!(e, Error::Usb(_)), "{e}");
+    }
 }
