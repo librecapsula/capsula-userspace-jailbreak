@@ -100,7 +100,11 @@ pub fn backup<T: Transport>(
     std::fs::create_dir_all(out_dir)?;
     std::fs::write(out_dir.join(".gpt.bin"), &gpt_raw)?;
     std::fs::write(out_dir.join("partition_table.tsv"), gpt.to_tsv())?;
-    let _ = std::fs::remove_file(out_dir.join("SHA256SUMS.txt")); // start over
+    // Both markers must go before the first partition is written: an
+    // interrupted re-dump into an old directory would otherwise leave a
+    // stale SUCCESS.txt next to partial sums and pass as a valid backup.
+    let _ = std::fs::remove_file(out_dir.join("SUCCESS.txt"));
+    let _ = std::fs::remove_file(out_dir.join("SHA256SUMS.txt"));
 
     let info = s.flash_detect()?;
     progress(Progress::Step(format!(

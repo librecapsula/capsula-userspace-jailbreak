@@ -121,12 +121,16 @@ impl BackupStore {
     }
 
     /// Verify SHA256SUMS.txt (every line, sha256sum format: hex + two
-    /// spaces + name). Fails on the first mismatch.
+    /// spaces + name) AND that the sums cover the whole partition map —
+    /// an interrupted re-dump leaves stale SUCCESS.txt with partial
+    /// sums, which must not pass as a valid backup. Fails on the first
+    /// problem.
     pub fn verify(&self) -> Result<(), StoreError> {
         let sums = self.dir.join("SHA256SUMS.txt");
         if !sums.is_file() {
             return Err(StoreError::Checksum("нет SHA256SUMS.txt".into()));
         }
+        let mut covered: std::collections::HashSet<String> = Default::default();
         for line in std::fs::read_to_string(&sums)?.lines() {
             let line = line.trim_end_matches('\r');
             if line.is_empty() {
@@ -142,6 +146,15 @@ impl BackupStore {
             let got = file_sha256(&f)?;
             if got != hexpart.to_lowercase() {
                 return Err(StoreError::Checksum(format!("SHA256 не сошёлся: {name}")));
+            }
+            covered.insert(name.to_string());
+        }
+        for (part, path) in self.files.iter() {
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !covered.contains(fname) {
+                return Err(StoreError::Checksum(format!(
+                    "нет суммы для раздела {part} — дамп неполный (прерван?)"
+                )));
             }
         }
         Ok(())
@@ -229,6 +242,34 @@ mod tests {
         assert!(BackupStore::exists_verified(&tmp));
         // corrupt the image -> false (checksum mismatch)
         std::fs::write(tmp.join("01_sec.img"), b"tampered").unwrap();
+        assert!(!BackupStore::exists_verified(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stale_success_with_partial_sums_is_not_verified() {
+        // interrupted re-dump scenario: SUCCESS.txt survived from an
+        // earlier run, but the sums only cover part of the table — the
+        // userdata image from the old dump must not be trusted
+        let tmp = std::env::temp_dir().join(format!("jb-store-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("SUCCESS.txt"), "SUCCESS").unwrap();
+        std::fs::write(
+            tmp.join("partition_table.tsv"),
+            "1\tsec\t512\t1\n2\tdata\t513\t3\n",
+        )
+        .unwrap();
+        let img1 = b"one".to_vec();
+        std::fs::write(tmp.join("01_sec.img"), &img1).unwrap();
+        std::fs::write(tmp.join("02_data.img"), b"old-userdata").unwrap();
+        let hex = {
+            let mut h = sha2::Sha256::new();
+            sha2::Digest::update(&mut h, &img1);
+            hex::encode(h.finalize())
+        };
+        // only the FIRST partition made it into the sums
+        std::fs::write(tmp.join("SHA256SUMS.txt"), format!("{hex}  01_sec.img\n")).unwrap();
         assert!(!BackupStore::exists_verified(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
     }
