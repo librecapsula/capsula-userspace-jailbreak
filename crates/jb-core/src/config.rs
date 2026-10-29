@@ -8,17 +8,10 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub ota: OtaConfig,
-    /// usbplug RAM-patch constants, bound to the loader build from the OTA.
+    /// usbplug RAM-patch constants, bound to the embedded loader build.
     pub usbplug: UsbplugPatch,
     /// Loader-mode instructions, shown while the tool waits for the device.
     pub hint: Hint,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct OtaConfig {
-    /// Platform code for the VK API — the loader comes from its OTA.
-    pub platform: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,7 +52,6 @@ mod tests {
     #[test]
     fn embedded_config_parses_with_expected_constants() {
         let c = Config::embedded();
-        assert_eq!(c.ota.platform, "Capsule-14");
         assert_eq!(c.usbplug.read_limit_addr, 0x0334_3EC4);
         assert_eq!(c.usbplug.signature1_addr, 0x0301_2290);
         assert_eq!(c.usbplug.signature1_hex, "29c54eb91f01096b02030054");

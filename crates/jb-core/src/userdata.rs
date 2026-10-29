@@ -67,11 +67,11 @@ pub fn overlay_files(marker: String) -> Vec<OverlayFile> {
 #[derive(Debug, thiserror::Error)]
 pub enum UserDataError {
     /// The dump did not mount as ext2/3/4 — raw or unknown format.
-    #[error("failed to mount userdata as ext2/3/4: {0}.\n  if the partition is not formatted on the device, run with --format-userdata")]
+    #[error("userdata не смонтировался как ext2/3/4: {0}.\n  если раздел на колонке не отформатирован — запустите с --format-userdata")]
     NotExt(String),
-    #[error("no space left in userdata: {0}")]
+    #[error("не хватает места в userdata: {0}")]
     NoSpace(String),
-    #[error("file {path} did not match the overlay after writing")]
+    #[error("файл {path} не совпал после записи")]
     Verify { path: String },
     #[error(transparent)]
     Fs(#[from] ext4_lwext4::Error),
@@ -100,14 +100,14 @@ pub fn build_image(
         if let (Ok(a), Ok(b)) = (std::fs::canonicalize(dump), std::fs::canonicalize(out)) {
             if a == b {
                 return Err(UserDataError::NotExt(
-                    "dump path and output path are the same — the dump is never modified".into(),
+                    "пути дампа и результата совпадают — дамп не модифицируется".into(),
                 ));
             }
         }
     }
     let device = if fresh {
         progress(Progress::Step(format!(
-            "userdata: clean ext2 of {} bytes (--format-userdata)",
+            "userdata: чистый ext2 на {} байт (--format-userdata)",
             part_size
         )));
         let device = FileBlockDevice::create(out, part_size)?;
@@ -115,7 +115,7 @@ pub fn build_image(
         FileBlockDevice::open(out)?
     } else {
         progress(Progress::Step(format!(
-            "userdata: copying the dump {} -> {}",
+            "userdata: копирую дамп {} → {}",
             dump.display(),
             out.display()
         )));
@@ -130,7 +130,7 @@ pub fn build_image(
     for f in files {
         write_file(&fs, f).map_err(|e| no_space(e, &f.path))?;
         progress(Progress::Step(format!(
-            "userdata: {} ({} bytes, mode {:o})",
+            "userdata: {} ({} байт, права {:o})",
             f.path,
             f.data.len(),
             f.mode
@@ -140,7 +140,7 @@ pub fn build_image(
     fs.umount()?;
 
     verify(out, files)?;
-    progress(Progress::Step("userdata: verification passed".into()));
+    progress(Progress::Step("userdata: проверка пройдена".into()));
     Ok(())
 }
 
@@ -148,7 +148,7 @@ pub fn build_image(
 fn no_space(e: UserDataError, path: &str) -> UserDataError {
     match e {
         UserDataError::Fs(ext4_lwext4::Error::NoSpace) => {
-            UserDataError::NoSpace(format!("{path} does not fit into the partition"))
+            UserDataError::NoSpace(format!("{path} не влезает в раздел"))
         }
         other => other,
     }
@@ -177,7 +177,7 @@ fn mkdir_all(fs: &Ext4Fs, dir: &Path) -> Result<(), UserDataError> {
         let comp = match comp {
             Component::RootDir | Component::Prefix(_) => continue,
             Component::Normal(c) => c.to_string_lossy().into_owned(),
-            other => return Err(UserDataError::NotExt(format!("unexpected path: {other:?}"))),
+            other => return Err(UserDataError::NotExt(format!("неожидаемый путь: {other:?}"))),
         };
         cur.push('/');
         cur.push_str(&comp);

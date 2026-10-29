@@ -294,8 +294,8 @@ fn rebind_pass(dir: &Path, log: &Path, rb: &mut Rebindings) -> Vec<String> {
                 .map_err(|e| e.to_string())
                 .and_then(|inf| force_bind(&inf, pkg.hwid));
             let msg = match attempt {
-                Ok(()) => format!("rebound {} -> WinUSB ({})", pkg.hwid, node.instance_id),
-                Err(e) => format!("rebind {} failed: {e}", pkg.hwid),
+                Ok(()) => format!("перевязал {} на WinUSB ({})", pkg.hwid, node.instance_id),
+                Err(e) => format!("перевязка {} не удалась: {e}", pkg.hwid),
             };
             log_line(log, &msg);
             actions.push(msg);
@@ -304,9 +304,10 @@ fn rebind_pass(dir: &Path, log: &Path, rb: &mut Rebindings) -> Vec<String> {
             if *strikes > REBIND_STRIKE_LIMIT {
                 rb.penalty_until = Some(Instant::now() + REBIND_STRIKE_PENALTY);
                 let msg = format!(
-                    "node {} not improving after {REBIND_STRIKE_LIMIT} rebinds — \
-                     backing off for {} s (see DRIVER-SETUP.txt for manual steps)",
+                    "узел {} не исправляется после {} перевязок — пауза {} с \
+                     (ручные шаги: DRIVER-SETUP.txt)",
                     node.instance_id,
+                    REBIND_STRIKE_LIMIT,
                     REBIND_STRIKE_PENALTY.as_secs()
                 );
                 log_line(log, &msg);
@@ -329,13 +330,13 @@ fn supervise(dir: &Path, done: &Path, log: &Path) {
     // machine would fail signature validation.
     for pkg in PACKAGES {
         if let Err(e) = install_cert(pkg.cer) {
-            log_line(log, &format!("cert install failed: {e}"));
+            log_line(log, &format!("не удалось поставить сертификат: {e}"));
         }
     }
     let mut rb = Rebindings::default();
     rebind_pass(dir, log, &mut rb);
     let _ = std::fs::write(&ready, b"ready");
-    log_line(log, "initial driver pass complete (ready)");
+    log_line(log, "первый проход по драйверам завершён (ready)");
     let start = Instant::now();
     let mut last_hb = Instant::now();
     while !done.exists() && start.elapsed() < HELPER_TTL {
@@ -390,8 +391,8 @@ impl Session {
         }
         if !self.elevated() {
             anyhow::bail!(
-                "process is not elevated: the Windows build requires an \
-                 administrator console (UAC manifest)"
+                "процесс без прав администратора: Windows-сборке нужна \
+                 повышенная консоль (UAC-манифест)"
             );
         }
         std::fs::create_dir_all(&self.dir)?;
@@ -399,7 +400,7 @@ impl Session {
         let done = self.done.clone();
         let log = self.log.clone();
         std::thread::spawn(move || supervise(&dir, &done, &log));
-        log_line(&self.log, "inline supervisor started");
+        log_line(&self.log, "супервизор драйверов запущен");
         self.started = true;
         Ok(())
     }
@@ -435,7 +436,7 @@ pub fn pause_if_own_console() {
         }
     }
     let mut out = std::io::stdout();
-    let _ = writeln!(out, "\npress Enter to close this window...");
+    let _ = writeln!(out, "\nнажмите Enter, чтобы закрыть окно...");
     let _ = out.flush();
     let mut line = String::new();
     let _ = std::io::stdin().lock().read_line(&mut line);

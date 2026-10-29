@@ -1,52 +1,37 @@
-capsula-jb — quick start
-========================
+capsula-jb — быстрый старт
+==========================
 
-1. No setup is needed: on Windows capsula-jb installs and maintains the
-   WinUSB driver binding itself. Windows will ask for administrator
-   rights (UAC) once, right at the start — that is expected: driver
-   management requires it. Started from a normal console, the elevated
-   tool runs in its own console window and waits for Enter at the end
-   so the output stays readable. See DRIVER-SETUP.txt only if something
-   unusual happens, or to switch the board back to the vendor driver
-   for RKDevTool.
-   macOS note: if the binary is blocked after downloading, run
-   `xattr -d com.apple.quarantine capsula-jb` (or see README).
-   Linux note: for access without root, see the udev rules in README.
+1. Запустите capsula-jb.
+   Windows спросит права администратора — это нормально, так и надо.
+   macOS: если бинарник заблокирован —
+     xattr -d com.apple.quarantine capsula-jb
+   Linux: для работы без root поставьте udev-правило из архива (см. README).
 
-2. Put the speaker into rockchip loader mode:
-   power off, peel off the bottom pad, connect micro-USB (OTG) to the
-   computer, hold the Recovery button (the lower of the two holes above
-   the micro-USB port) with a needle while powering on, release after a
-   few seconds. The board shows up as USB 2207:330d.
+2. Введите колонку в режим лоадера: выключите питание, снимите нижнюю
+   накладку, подключите micro-USB (OTG) к компьютеру. Иголкой зажмите
+   Recovery — нижнее из двух отверстий над micro-USB — и, удерживая,
+   подайте питание. Отпустите через пару секунд.
+   (Мини: кнопки Recovery нет — держите сенсорную кнопку при включении.)
 
-3. Run:
-   capsula-jb            (full scenario: dump -> adbd overlay -> reboot)
+3. capsula-jb сделает всё сам (лоадер уже вшит в бинарник, интернет
+   не нужен): снимет полный бэкап в backup/<серийник>/, положит в
+   userdata оверлей с adbd и перезагрузит колонку. Перед записью
+   спросит «продолжить? [y/N]».
+   Если для этого серийника уже есть валидный бэкап — дамп пропускается.
 
-   Backups are stored per speaker serial in backup/<serial>/. If a
-   valid backup of that serial already exists, the dump is skipped and
-   the tool goes straight to writing userdata (delete the folder to
-   force a fresh dump).
+   Другие команды:
+     capsula-jb backup     только дамп, на колонку не пишется
+     capsula-jb --help     все опции
 
-   First-generation ("gift") speakers are detected automatically: no
-   full backup is possible on them (the tool explains why), it offers
-   to flash a freshly built userdata with the adbd overlay instead —
-   existing userdata content is lost in that mode.
+   Колонки первого поколения («подарочные») распознаются сами: бэкапа
+   на них нет, инструмент предложит прошить userdata с нуля — его
+   текущее содержимое при этом теряется.
 
-   Useful variants:
-   capsula-jb backup     dump all partitions only, nothing is written
-   capsula-jb --help     all options
+4. Когда инструмент напишет «ADB поднят»:
+     adb devices && adb shell     # root, без авторизации
+   По Wi-Fi: adb connect <ip-колонки>:5555
 
-4. When the tool reports "ADB is up", connect over USB:
-   adb devices && adb shell       (root shell, no authorization)
-
-   The speaker also listens for ADB over the network once it is
-   connected to Wi-Fi (with the speaker on and configured):
-   adb connect <speaker-ip>:5555 && adb shell
-
-Scripted / agent use: the tool prints "proceed? [y/N]" and waits for
-input before writing userdata. With a non-interactive stdin (CI, LLM
-agents) it exits with an error instead, writing nothing — re-run with
---yes once the write has been approved. `backup` never asks anything.
-Full agent instructions (driver toggle, safety rules): AGENTS.md.
-
-See README.md for details, safety notes and troubleshooting.
+Для скриптов и агентов: с неинтерактивным stdin подтверждение записи
+завершается ошибкой, ничего не записав — перезапустите с --yes, когда
+запись согласована. Правила для агентов — AGENTS.md. Подробности и
+решение проблем — README.md.

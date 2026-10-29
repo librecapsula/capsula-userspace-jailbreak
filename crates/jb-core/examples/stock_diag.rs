@@ -97,7 +97,7 @@ fn main() {
 
     // the very last flash sector: the backup GPT header lives there
     if let Ok(f) = &flash {
-        let last = f.sector_total as u32 - 1;
+        let last = f.sector_total - 1;
         let mut buf = vec![0u8; 512];
         match s.read_lba(last, &mut buf) {
             Ok(()) => println!(

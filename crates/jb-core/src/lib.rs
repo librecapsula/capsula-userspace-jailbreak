@@ -4,6 +4,12 @@
 //! Method: userspace overwrite. userdata is not signed and is freely
 //! rewritable; no other partition is touched. The configuration lives
 //! in resources/config.toml (embedded into the binary).
+//!
+//! Today the crate is the Rockchip (RK3308) domain: GPT, the full-dump
+//! pipeline, the userdata overlay, the embedded loader, bring-up and
+//! first-generation detection. The platform dispatch (which backend a
+//! USB device belongs to) lives one level up, in jb-cli
+//! (`backend::Backend` / `rockchip`).
 
 pub mod backup;
 pub mod backup_store;
@@ -11,14 +17,6 @@ pub mod config;
 pub mod firstgen;
 pub mod flash;
 pub mod gpt;
-pub mod ota;
-pub mod rkfw;
+pub mod loader;
 pub mod session;
 pub mod userdata;
-
-/// SoC backend identity. Rockchip only today; the contract is kept for
-/// a future Amlogic backend.
-pub trait SocBackend {
-    /// Human-readable vendor name.
-    fn name(&self) -> &'static str;
-}

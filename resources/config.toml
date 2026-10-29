@@ -1,18 +1,12 @@
-# capsula-jb — tool configuration.
+# capsula-jb — конфигурация инструмента.
 #
-# A single loader for all supported boards: the signed usbplug from the
-# Capsule-14 OTA (the same build is shipped in every current firmware).
-# The package is downloaded once into ota/ and the loader is extracted
-# from it.
+# Лоадер один на все платы: подписанный usbplug из OTA Capsule-14 44.90.
+# Он вшит в бинарник (resources/loader/loader.bin) — сеть не нужна.
 
-[ota]
-# Platform code for the VK API (https://vc.go.mail.ru/device/firmware?platform=...).
-platform = "Capsule-14"
-
-# usbplug RAM-patch constants. read_limit_addr points to the u32 LE read
-# limit (in sectors) inside the running usbplug; the stock value is
-# 0x10000 and everything above it reads back as 0xCC, so the limit is
-# raised to the flash size before dumping.
+# Константы RAM-патча usbplug. read_limit_addr указывает на u32 LE —
+# предел чтения (в секторах) внутри работающего usbplug; стоковое
+# значение 0x10000, всё выше читается как 0xCC, поэтому перед дампом
+# предел поднимается до размера флеша.
 [usbplug]
 read_limit_addr = 0x3343ec4
 signature1_addr = 0x03012290
@@ -20,23 +14,14 @@ signature1_hex = "29c54eb91f01096b02030054"
 signature2_addr = 0x03012390
 signature2_hex = "29c54eb91f01096bc2000054"
 
-# How to put the speaker into rockchip loader mode. Shown in full while
-# the tool is waiting for the device (big Capsulas and minis enter the
-# mode differently).
+# Подсказка на время ожидания колонки в download-режиме (большие
+# Капсулы и мини входят в него по-разному).
 [hint]
 text = """
-How to put the speaker into rockchip loader mode:
+Жду колонку в режиме лоадера (USB 2207:330d / 330e)
 
-  Big Capsula: power the unit off, peel off the bottom pad, connect
-  micro-USB (OTG) to the computer. Take a needle: the two holes above
-  the micro-USB port are the Recovery button. Press the LOWER one
-  (farther from the power jack) and, holding it, power the unit on.
-  Release after a few seconds — the board shows up as 2207:330d.
-
-  Mini: there is no Recovery button. Hold the touch button while
-  powering on, or press Ctrl+D in the debug UART console with OTG
-  connected (rockusb, 2207:330d), or Ctrl+B (MaskROM, 2207:330e).
-
-  A short-lived 2207:0006 at startup is the stock Linux gadget (44.90+
-  firmware ships without adbd, the gadget dies within a second): it is
-  NOT a download mode. The tool waits for 330d/330e and only logs 0006."""
+  Большая Капсула: выключите питание, снимите нижнюю накладку,
+  подключите micro-USB (OTG) к компьютеру. Иголкой зажмите Recovery —
+  ближнее к центру из двух отверстий над micro-USB  — и, удерживая, подайте
+  питание. Отпустите через несколько секунд.
+"""

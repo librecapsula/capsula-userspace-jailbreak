@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("no valid backup at {0} — run backup first")]
+    #[error("в {0} нет валидного бэкапа — сначала снимите дамп (backup)")]
     Missing(String),
-    #[error("backup is incomplete: no SUCCESS.txt (interrupted?) — rerun backup")]
+    #[error("бэкап неполный: нет SUCCESS.txt (прерван?) — повторите дамп")]
     Incomplete,
-    #[error("checksum: {0}")]
+    #[error("контрольные суммы: {0}")]
     Checksum(String),
-    #[error("file {path}: {reason}")]
+    #[error("файл {path}: {reason}")]
     Bad { path: PathBuf, reason: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -49,8 +49,8 @@ impl BackupStore {
 
     /// Backup directory name for a device serial (`backup/<dir_name>`).
     /// The serial is USB-reported and normally hex-ish; sanitize anyway.
-    /// An empty serial maps to "unknown" — and callers must never trust
-    /// a cached "unknown" backup (no identity behind it).
+    /// An empty serial maps to "unknown" — defensive only: bring_up
+    /// refuses unidentified personas, so the CLI never writes there.
     pub fn dir_name(serial: &str) -> String {
         let s = sanitize(serial.trim());
         if s.is_empty() {
@@ -125,7 +125,7 @@ impl BackupStore {
     pub fn verify(&self) -> Result<(), StoreError> {
         let sums = self.dir.join("SHA256SUMS.txt");
         if !sums.is_file() {
-            return Err(StoreError::Checksum("no SHA256SUMS.txt".into()));
+            return Err(StoreError::Checksum("нет SHA256SUMS.txt".into()));
         }
         for line in std::fs::read_to_string(&sums)?.lines() {
             let line = line.trim_end_matches('\r');
@@ -134,16 +134,16 @@ impl BackupStore {
             }
             let (hexpart, name) = line
                 .split_once("  ")
-                .ok_or_else(|| StoreError::Checksum(format!("malformed line: {line}")))?;
+                .ok_or_else(|| StoreError::Checksum(format!("битая строка: {line}")))?;
             let f = self.dir.join(name);
             if !f.is_file() {
                 return Err(StoreError::Checksum(format!(
-                    "file from the sums is missing: {name}"
+                    "нет файла из сумм: {name}"
                 )));
             }
             let got = file_sha256(&f)?;
             if got != hexpart.to_lowercase() {
-                return Err(StoreError::Checksum(format!("SHA256 mismatch: {name}")));
+                return Err(StoreError::Checksum(format!("SHA256 не сошёлся: {name}")));
             }
         }
         Ok(())

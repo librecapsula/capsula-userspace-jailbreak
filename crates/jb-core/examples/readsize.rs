@@ -12,30 +12,24 @@
 //! the device streams into a pipe nobody drains), so the run stops
 //! there on purpose — power-cycle the board afterwards to recover.
 //!
-//! Run from the repository root (uses the ota/ loader cache):
 //!   cargo run -p jb-core --example readsize --release
 
 use jb_core::backup::patch_read_limit;
 use jb_core::config::Config;
 use jb_core::session::{bring_up, BringUpError};
-use std::path::Path;
 
 fn main() -> anyhow::Result<()> {
     let config = Config::embedded();
-    let (loader, ver) =
-        jb_core::ota::ensure_loader(Path::new("ota"), &config.ota.platform, &|_| {})?;
-    if let Some(v) = ver {
-        println!("loader OTA version: {v}");
-    }
-    let (up, _serial) = match bring_up(&config, &loader, None, &|_| {}, None) {
+    let loader = jb_core::loader::embedded()?;
+    let up = match bring_up(&config, &loader, None, &|_| {}) {
         Ok(v) => v,
         Err(BringUpError::LoaderRejected) => anyhow::bail!("BootROM rejected the loader"),
         Err(e) => return Err(e.into()),
     };
-    let mut s = match up {
-        jb_core::session::BroughtUp::Ours(s) => s,
-        _ => anyhow::bail!("unexpected first-generation persona — this probe needs our usbplug"),
-    };
+    if up.firstgen {
+        anyhow::bail!("unexpected first-generation persona — this probe needs our usbplug");
+    }
+    let mut s = up.session;
     let info = s.flash_detect()?;
     println!(
         "usbplug up, flash: {} sectors ({} MiB), block {}",

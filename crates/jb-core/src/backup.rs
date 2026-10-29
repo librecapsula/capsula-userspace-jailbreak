@@ -37,7 +37,7 @@ pub fn patch_read_limit<T: Transport>(
     let total = info.sector_total;
     if total <= 34 {
         return Err(UsbError::WrongMode(format!(
-            "bad sector count from usbplug: {total}"
+            "usbplug отдал бредовый размер флеша: {total} секторов"
         )));
     }
     let addr = config.usbplug.read_limit_addr;
@@ -46,19 +46,19 @@ pub fn patch_read_limit<T: Transport>(
     let old = u32::from_le_bytes(cur);
     if old != total {
         progress(Progress::Step(format!(
-            "read limit: {old} -> {total} sectors (usbplug RAM patch)"
+            "предел чтения: {old} → {total} секторов (RAM-патч usbplug)"
         )));
         s.write_mem(addr, &total.to_le_bytes())?;
         let mut chk = [0u8; 4];
         s.read_mem(addr, &mut chk)?;
         if chk != total.to_le_bytes() {
             return Err(UsbError::WrongMode(
-                "read limit patch did not stick (readback mismatch)".into(),
+                "RAM-патч не применился (проверочное чтение не совпало)".into(),
             ));
         }
     } else {
         progress(Progress::Step(format!(
-            "read limit already extended: {total} sectors"
+            "предел чтения уже расширен: {total} секторов"
         )));
     }
     Ok(old)
@@ -74,10 +74,10 @@ pub fn cc_guard<T: Transport>(
     s.read_lba(GUARD_LBA, &mut buf)?;
     if buf.iter().all(|&b| b == 0xcc) {
         return Err(UsbError::WrongMode(format!(
-            "LBA {GUARD_LBA:#x} still reads as 0xCC: the read limit patch is not in effect"
+            "LBA {GUARD_LBA:#x} читается как 0xCC — RAM-патч не действует"
         )));
     }
-    progress(Progress::Step("0xCC guard passed".into()));
+    progress(Progress::Step("маска 0xCC снята".into()));
     Ok(())
 }
 
@@ -92,7 +92,7 @@ pub fn backup<T: Transport>(
     let old_limit = patch_read_limit(s, config, progress)?;
     cc_guard(s, progress)?;
 
-    progress(Progress::Step("reading GPT".into()));
+    progress(Progress::Step("читаю GPT".into()));
     let mut gpt_raw = vec![0u8; 34 * 512];
     s.read_lba(1, &mut gpt_raw)?;
     let gpt = Gpt::parse(&gpt_raw).map_err(|e| UsbError::Loader(format!("GPT: {e}")))?;
@@ -104,7 +104,7 @@ pub fn backup<T: Transport>(
 
     let info = s.flash_detect()?;
     progress(Progress::Step(format!(
-        "{} partitions, flash size {} sectors",
+        "разделов: {}, флеш: {} секторов",
         gpt.entries.len(),
         info.sector_total
     )));
@@ -126,7 +126,7 @@ pub fn backup<T: Transport>(
             if done == 0 && chunk[..512].iter().all(|&b| b == 0xcc) {
                 let _ = std::fs::remove_file(&path);
                 return Err(UsbError::WrongMode(format!(
-                    "{}: all 0xCC — mask active, backup unusable",
+                    "{}: весь 0xCC — маска активна, дамп негоден",
                     e.name
                 )));
             }
@@ -144,7 +144,7 @@ pub fn backup<T: Transport>(
         let size = std::fs::metadata(&path)?.len();
         if size != e.sectors * 512 {
             return Err(UsbError::Loader(format!(
-                "size mismatch: {file_name} ({size} != {})",
+                "размер не сошёлся: {file_name} ({size} != {})",
                 e.sectors * 512
             )));
         }
@@ -161,7 +161,7 @@ pub fn backup<T: Transport>(
         format!("SUCCESS: {}\n", out_dir.display()),
     )?;
     progress(Progress::Step(format!(
-        "done: {} (logical GPT dump, not raw NAND)",
+        "готово: {} (дамп по GPT, не сырой NAND)",
         out_dir.display()
     )));
     Ok(BackupReport {

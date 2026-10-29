@@ -21,14 +21,14 @@ pub fn write_partition_padded<T: Transport>(
 ) -> rockusb::Result<()> {
     let e = gpt
         .find(part)
-        .ok_or_else(|| UsbError::Loader(format!("no partition {part} in the device GPT")))?;
+        .ok_or_else(|| UsbError::Loader(format!("в GPT колонки нет раздела {part}")))?;
     let psize = e.sectors as usize * 512;
     let fsize = std::fs::metadata(image)
         .map_err(|err| UsbError::Loader(format!("{}: {err}", image.display())))?
         .len() as usize;
     if fsize > psize {
         return Err(UsbError::Loader(format!(
-            "{part}: image {} is larger than the partition ({psize} bytes)",
+            "{part}: образ {} больше раздела ({psize} байт)",
             image.display()
         )));
     }
