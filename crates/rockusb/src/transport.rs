@@ -25,9 +25,9 @@ pub enum DeviceMode {
 impl DeviceMode {
     pub fn pid(&self) -> u16 {
         match self {
-            DeviceMode::Loader => 0x330d,
-            DeviceMode::MaskRom | DeviceMode::UsbPlug => 0x330e,
-            DeviceMode::LinuxGadget => 0x0006,
+            DeviceMode::Loader => crate::USB_PID_LOADER,
+            DeviceMode::MaskRom | DeviceMode::UsbPlug => crate::USB_PID_MASKROM,
+            DeviceMode::LinuxGadget => crate::USB_PID_LINUX_GADGET,
             DeviceMode::Other(p) => *p,
         }
     }
@@ -37,16 +37,25 @@ impl DeviceMode {
         crate::USB_VID_ROCKCHIP
     }
 
+    /// The single classification table: a bus device (vid, pid,
+    /// iProduct) to its mode, None for devices that are not ours
+    /// (foreign VIDs).
+    pub fn from_bus(vid: u16, pid: u16, product: Option<&str>) -> Option<DeviceMode> {
+        if vid != crate::USB_VID_ROCKCHIP {
+            return None;
+        }
+        Some(match (pid, product) {
+            (crate::USB_PID_LOADER, _) => DeviceMode::Loader,
+            (crate::USB_PID_MASKROM, Some("USB-MSC")) => DeviceMode::UsbPlug,
+            (crate::USB_PID_MASKROM, _) => DeviceMode::MaskRom,
+            (crate::USB_PID_LINUX_GADGET, _) => DeviceMode::LinuxGadget,
+            (p, _) => DeviceMode::Other(p),
+        })
+    }
+
     /// Does a bus device (vid, pid, iProduct) belong to this mode?
     fn matches(&self, vid: u16, pid: u16, product: Option<&str>) -> bool {
-        vid == self.vid() && pid == self.pid() && {
-            // usbplug and MaskROM share the PID — told apart by iProduct
-            match self {
-                DeviceMode::UsbPlug => product == Some("USB-MSC"),
-                DeviceMode::MaskRom => product != Some("USB-MSC"),
-                _ => true,
-            }
-        }
+        DeviceMode::from_bus(vid, pid, product).is_some_and(|m| m == *self)
     }
 
     /// The "best" of the present modes: 330d > usbplug > maskrom >
@@ -155,7 +164,6 @@ impl NusbTransport {
                 }
             }
         }
-        let (ep_in, ep_out) = (ep_in, ep_out);
         let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) else {
             return Err(Error::Usb("device has no bulk endpoints".into()));
         };
@@ -279,18 +287,10 @@ pub fn device_serial(mode: &DeviceMode) -> Option<String> {
 pub fn list_modes() -> Result<Vec<DeviceMode>> {
     let mut modes: Vec<DeviceMode> = Vec::new();
     for d in nusb::list_devices().wait()? {
-        if d.vendor_id() != crate::USB_VID_ROCKCHIP {
-            continue;
-        }
-        let m = match d.product_id() {
-            0x330d => DeviceMode::Loader,
-            0x330e if d.product_string() == Some("USB-MSC") => DeviceMode::UsbPlug,
-            0x330e => DeviceMode::MaskRom,
-            0x0006 => DeviceMode::LinuxGadget,
-            p => DeviceMode::Other(p),
-        };
-        if !modes.contains(&m) {
-            modes.push(m);
+        if let Some(m) = DeviceMode::from_bus(d.vendor_id(), d.product_id(), d.product_string()) {
+            if !modes.contains(&m) {
+                modes.push(m);
+            }
         }
     }
     Ok(modes)
@@ -331,5 +331,32 @@ mod tests {
     fn other_transfer_errors_stay_usb() {
         let e = bulk_error("bulk-OUT", 2, 31, TransferError::Stall);
         assert!(matches!(e, Error::Usb(_)), "{e}");
+    }
+
+    #[test]
+    fn from_bus_is_the_single_persona_table() {
+        use DeviceMode::*;
+        assert_eq!(DeviceMode::from_bus(0x2207, 0x330d, None), Some(Loader));
+        // usbplug and MaskROM share the PID — told apart by iProduct
+        assert_eq!(
+            DeviceMode::from_bus(0x2207, 0x330e, Some("USB-MSC")),
+            Some(UsbPlug)
+        );
+        assert_eq!(DeviceMode::from_bus(0x2207, 0x330e, None), Some(MaskRom));
+        assert_eq!(
+            DeviceMode::from_bus(0x2207, 0x330e, Some("Maskrom")),
+            Some(MaskRom)
+        );
+        assert_eq!(
+            DeviceMode::from_bus(0x2207, 0x0006, None),
+            Some(LinuxGadget)
+        );
+        assert_eq!(
+            DeviceMode::from_bus(0x2207, 0x1234, None),
+            Some(Other(0x1234))
+        );
+        // a foreign VID (the fastboot gadget lives under Google's) is
+        // nobody: invisible to the tool
+        assert_eq!(DeviceMode::from_bus(0x18d1, 0xd00d, None), None);
     }
 }
