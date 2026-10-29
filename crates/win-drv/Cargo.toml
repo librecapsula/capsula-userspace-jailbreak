@@ -8,7 +8,6 @@ repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-log = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -16,7 +15,5 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Cryptography",
     "Win32_System_Console",
     "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Registry", # SHELLEXECUTEINFOW is gated behind it
     "Win32_Foundation",
 ] }

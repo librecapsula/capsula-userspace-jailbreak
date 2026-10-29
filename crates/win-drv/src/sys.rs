@@ -1,5 +1,5 @@
 //! Windows implementation: devnode scanning (setupapi), package
-//! installation (newdev + crypt32) and the elevated helper.
+//! installation (newdev + crypt32) and the supervisor thread.
 
 use crate::{log_line, Package, PACKAGES};
 use std::path::{Path, PathBuf};
@@ -99,6 +99,9 @@ pub fn rockchip_nodes() -> Vec<Node> {
 
             let hwid = reg_string(set, &dev, SPDRP_HARDWAREID, true);
             let service = reg_string(set, &dev, SPDRP_SERVICE, false);
+            let (Some(hwid), Some(service)) = (hwid, service) else {
+                continue;
+            };
             out.push(Node {
                 instance_id,
                 hwid,
@@ -111,43 +114,54 @@ pub fn rockchip_nodes() -> Vec<Node> {
 }
 
 /// SPDRP_* as a string; `multi` takes the first entry of a REG_MULTI_SZ.
-fn reg_string(set: isize, dev: &SP_DEVINFO_DATA, prop: u32, multi: bool) -> String {
+/// None = the property is absent or could not be read (a node without a
+/// readable service must be skipped, not treated as misbound).
+fn reg_string(set: isize, dev: &SP_DEVINFO_DATA, prop: u32, multi: bool) -> Option<String> {
     unsafe {
-        let mut needed = 0u32;
-        SetupDiGetDeviceRegistryPropertyW(
-            set,
-            dev,
-            prop,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0,
-            &mut needed,
-        );
-        if needed == 0 {
-            return String::new();
+        // size-then-read: the property can grow between the two calls
+        // (ERROR_INSUFFICIENT_BUFFER on the read) — retry with the fresh
+        // size instead of silently returning an empty value.
+        for _ in 0..3 {
+            let mut needed = 0u32;
+            if SetupDiGetDeviceRegistryPropertyW(
+                set,
+                dev,
+                prop,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            ) == 0
+            {
+                return None;
+            }
+            if needed == 0 {
+                return Some(String::new());
+            }
+            let mut buf = vec![0u8; needed as usize];
+            if SetupDiGetDeviceRegistryPropertyW(
+                set,
+                dev,
+                prop,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                needed,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                continue;
+            }
+            let (words, _) = buf.as_chunks::<2>();
+            let units: Vec<u16> = words.iter().map(|c| u16::from_ne_bytes(*c)).collect();
+            let s = narrow(&units);
+            return Some(if multi {
+                // first line of the multi-sz is the specific hardware ID
+                s.lines().next().unwrap_or("").into()
+            } else {
+                s
+            });
         }
-        let mut buf = vec![0u8; needed as usize];
-        if SetupDiGetDeviceRegistryPropertyW(
-            set,
-            dev,
-            prop,
-            std::ptr::null_mut(),
-            buf.as_mut_ptr(),
-            needed,
-            std::ptr::null_mut(),
-        ) == 0
-        {
-            return String::new();
-        }
-        let (words, _) = buf.as_chunks::<2>();
-        let units: Vec<u16> = words.iter().map(|c| u16::from_ne_bytes(*c)).collect();
-        let s = narrow(&units);
-        if multi {
-            // first line of the multi-sz is the specific hardware ID
-            s.lines().next().unwrap_or("").into()
-        } else {
-            s
-        }
+        None
     }
 }
 
@@ -193,8 +207,6 @@ pub fn install_cert(cer: &[u8]) -> Result<(), String> {
             let err = GetLastError();
             CertCloseStore(store, 0);
             if ok == 0 {
-                // "object already exists" is the normal second-run path
-                // (CRYPT_E_EXISTS = 0x80092005); anything else is real.
                 return Err(format!(
                     "CertAddEncodedCertificateToStore({name}, machine) failed: {err}"
                 ));
@@ -274,7 +286,6 @@ fn rebind_pass(dir: &Path, log: &Path, rb: &mut Rebindings) -> Vec<String> {
         return actions;
     }
     let nodes = rockchip_nodes();
-    // nodes that recovered on their own clear their strike record
     for n in &nodes {
         if n.bound_ok() {
             rb.strikes.remove(&n.instance_id);
@@ -293,26 +304,31 @@ fn rebind_pass(dir: &Path, log: &Path, rb: &mut Rebindings) -> Vec<String> {
             let attempt = materialize(pkg, dir)
                 .map_err(|e| e.to_string())
                 .and_then(|inf| force_bind(&inf, pkg.hwid));
-            let msg = match attempt {
+            let msg = match &attempt {
                 Ok(()) => format!("перевязал {} на WinUSB ({})", pkg.hwid, node.instance_id),
                 Err(e) => format!("перевязка {} не удалась: {e}", pkg.hwid),
             };
             log_line(log, &msg);
             actions.push(msg);
-            let strikes = rb.strikes.entry(node.instance_id.clone()).or_insert(0);
-            *strikes += 1;
-            if *strikes > REBIND_STRIKE_LIMIT {
-                rb.penalty_until = Some(Instant::now() + REBIND_STRIKE_PENALTY);
-                let msg = format!(
-                    "узел {} не исправляется после {} перевязок — пауза {} с \
-                     (ручные шаги: DRIVER-SETUP.txt)",
-                    node.instance_id,
-                    REBIND_STRIKE_LIMIT,
-                    REBIND_STRIKE_PENALTY.as_secs()
-                );
-                log_line(log, &msg);
-                actions.push(msg);
-                rb.strikes.clear();
+            // Strikes count only FAILED rebinds: a node that keeps
+            // needing (and getting) rebinds is a no-improvement loop
+            // worth backing off from; healthy churn must not penalize.
+            if attempt.is_err() {
+                let strikes = rb.strikes.entry(node.instance_id.clone()).or_insert(0);
+                *strikes += 1;
+                if *strikes > REBIND_STRIKE_LIMIT {
+                    rb.penalty_until = Some(Instant::now() + REBIND_STRIKE_PENALTY);
+                    let msg = format!(
+                        "узел {} не исправляется после {} перевязок — пауза {} с \
+                         (ручные шаги: DRIVER-SETUP.txt)",
+                        node.instance_id,
+                        REBIND_STRIKE_LIMIT,
+                        REBIND_STRIKE_PENALTY.as_secs()
+                    );
+                    log_line(log, &msg);
+                    actions.push(msg);
+                    rb.strikes.clear();
+                }
             }
         }
     }
@@ -413,7 +429,14 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = std::fs::write(&self.done, b"done");
+        if let Err(e) = std::fs::write(&self.done, b"done") {
+            // without the done file the supervisor keeps rebinging until
+            // its TTL — leave a trace in the session log
+            log_line(
+                &self.log,
+                &format!("не удалось остановить супервизор (done): {e}"),
+            );
+        }
     }
 }
 

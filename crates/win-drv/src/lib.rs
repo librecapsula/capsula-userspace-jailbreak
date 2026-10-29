@@ -13,9 +13,10 @@
 //! generated WinUSB driver packages (see `resources/drivers/winusb/`),
 //! installs their self-signed signer certificates into the machine
 //! trust stores, and force-binds every Rockchip devnode to WinUSB —
-//! from an elevated helper process when needed (one UAC prompt). The
-//! binding work itself is `UpdateDriverForPlugAndPlayDevices`: the
-//! same newdev API Zadig calls.
+//! the process itself is elevated (UAC manifest), the supervisor is a
+//! background thread of the run. The binding work itself is
+//! `UpdateDriverForPlugAndPlayDevices`: the same newdev API Zadig
+//! calls.
 //!
 //! On other platforms everything is a no-op.
 

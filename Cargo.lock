@@ -1004,7 +1004,6 @@ name = "win-drv"
 version = "0.1.2"
 dependencies = [
  "anyhow",
- "log",
  "windows-sys 0.59.0",
 ]
 
