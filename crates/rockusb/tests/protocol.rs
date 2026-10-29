@@ -284,3 +284,25 @@ fn maskrom_upload_chunking_and_edge_4095() {
         .upload_memory(0x0472, &payload, false)
         .expect("upload 4095");
 }
+
+#[test]
+fn maskrom_upload_edge_4094_sends_pend_byte() {
+    // 4094 bytes: payload+CRC is exactly 4096 (one chunk), and the
+    // BootROM protocol wants one extra byte in a SEPARATE 1-byte
+    // control transfer — a bit-exact edge; a regression here silently
+    // kills the loader download
+    let payload = vec![0x55u8; 4094];
+    let mut one = payload.clone();
+    let crc = crc16_xrock(0xffff, &payload);
+    one.push((crc >> 8) as u8);
+    one.push((crc & 0xff) as u8);
+    assert_eq!(one.len(), 4096);
+
+    let t = MockTransport::new(vec![
+        Step::ControlOut(0x0c, 0, 0x0471, one),
+        Step::ControlOut(0x0c, 0, 0x0471, vec![0u8; 1]),
+    ]);
+    MaskRomSession::new(t)
+        .upload_memory(0x0471, &payload, false)
+        .expect("upload 4094");
+}
