@@ -1,4 +1,4 @@
-//! Backup directory: a layout byte-compatible with the bash v1
+//! Backup directory: a legacy-compatible layout
 //! (NN_<name>.img, .gpt.bin, partition_table.tsv, SHA256SUMS.txt,
 //! SUCCESS.txt). Opening/verification — for the userdata overlay step.
 

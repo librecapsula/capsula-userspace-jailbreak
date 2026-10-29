@@ -1,4 +1,4 @@
-//! Full GPT partition dump (a port of backup.sh, the LibreRD method).
+//! Full GPT partition dump (the LibreRD method).
 //! Bring-up (MaskROM -> loader into RAM -> signatures) is done by the
 //! session BEFORE this is called.
 
@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
 
-/// Sectors per flash read (bash v1: CHUNK=8192 = 4 MiB).
+/// Sectors per flash read (4 MiB).
 pub const CHUNK_SECTORS: u32 = 8192;
 /// Guard sector for the 0xCC check: first one beyond the stock read limit.
 pub const GUARD_LBA: u32 = 0x10000;
@@ -24,7 +24,7 @@ pub struct BackupReport {
     pub read_limit_old: u32,
 }
 
-/// Patch the usbplug read limit in RAM (backup.sh:72-91): without it,
+/// Patch the usbplug read limit in RAM: without it,
 /// everything above 0x10000 sectors reads back as 0xCC. Returns the
 /// previous value.
 pub fn patch_read_limit<T: Transport>(

@@ -125,7 +125,7 @@ fn loader_read_lba_two_sectors() {
 
 #[test]
 fn loader_write_mem_limit_patch() {
-    // usbplug read-limit patch (backup.sh): 4 bytes at 0x3343ec4.
+    // usbplug read-limit patch: 4 bytes at 0x3343ec4.
     // length=0 (rock.c); the data follows the CBW.
     let val = 447455u32.to_le_bytes().to_vec();
     let t = MockTransport::new(vec![

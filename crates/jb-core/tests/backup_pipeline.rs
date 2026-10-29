@@ -80,8 +80,7 @@ fn build_gpt() -> Vec<u8> {
     hdr[88..92].copy_from_slice(&ecrc.to_le_bytes());
     hdr[40..48].copy_from_slice(&34u64.to_le_bytes()); // first usable
     hdr[48..56].copy_from_slice(&4000u64.to_le_bytes()); // last usable
-                                                         // header CRC (the CRC field is zeroed — it is zero anyway)
-    hdr[16..20].fill(0);
+    hdr[16..20].fill(0); // CRC field is zeroed for the header CRC
     let hcrc = crc32fast::hash(&hdr[..92]);
     hdr[16..20].copy_from_slice(&hcrc.to_le_bytes());
     data[512..512 + 4 * 128].copy_from_slice(&blob);

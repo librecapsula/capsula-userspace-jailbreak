@@ -1,7 +1,7 @@
 //! userdata overlay: base image + overlay files -> a partition image
-//! ready to flash. The filesystem is modified with ext4-lwext4 (an
-//! lwext4 wrapper): the dump copy is mounted, the files are written,
-//! the image is unmounted and re-read for verification.
+//! ready to flash. The filesystem is modified in place with ext4-lwext4
+//! (an lwext4 wrapper): mount a copy, write the files, unmount, then
+//! re-read and verify the result.
 //!
 //! The stock firmware mounts userdata as ext2 at /data and uses
 //! /data/overlay/upper as the overlayfs upper layer over the read-only

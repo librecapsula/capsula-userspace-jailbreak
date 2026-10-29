@@ -3,9 +3,7 @@
 //! поддерживаемые платы — во всех актуальных прошивках rk3308 это одна
 //! и та же сборка.
 //!
-//! Раньше лоадер качался с VK CDN и извлекался из RKFW-пакета при
-//! первом запуске (кеш в ota/); хранение его в репозитории разрешено,
-//! теперь он зашит в бинарник — инструменту не нужна сеть.
+//! Лоадер зашит в бинарник; сеть инструменту не нужна.
 
 use rockusb::{Error as UsbError, LoaderContainer};
 use std::sync::OnceLock;
@@ -28,8 +26,7 @@ mod tests {
     use super::*;
 
     /// The embedded loader must be the signed RK3308 usbplug the
-    /// MaskROM download expects (these used to be checked only by the
-    /// disabled network test against a fresh OTA download).
+    /// MaskROM download expects.
     #[test]
     fn embedded_loader_parses() {
         let c = embedded().expect("вшитый лоадер должен разбираться");

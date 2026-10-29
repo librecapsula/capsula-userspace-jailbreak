@@ -5,10 +5,10 @@ use crate::error::Result;
 use crate::transport::{list_modes, DeviceMode};
 use std::time::{Duration, Instant};
 
-/// Bus poll interval (bash v1: 50 ms — the mini loader window is < 1 s).
+/// Bus poll interval (the mini loader window is < 1 s).
 pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Stability window: an appearance must persist longer than this to
-/// count (bash v1: 150 ms).
+/// count (150 ms).
 pub const DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +50,7 @@ impl DeviceMonitor {
         let cur = bus_modes();
         let mut events = Vec::new();
         if !self.started {
-            // whatever is present at start is not an event (as in v1)
+            // whatever is present at start is not an event
             self.started = true;
         } else {
             for m in &cur {

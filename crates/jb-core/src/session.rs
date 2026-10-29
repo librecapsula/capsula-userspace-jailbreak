@@ -1,5 +1,4 @@
-//! Device bring-up (a port of board_ready / the backup.sh loop) and
-//! pipeline primitives shared by the operations.
+//! Device bring-up and pipeline primitives shared by the operations.
 //!
 //! Every regular-column operation runs over OUR usbplug loaded into RAM
 //! from the OTA loader: the RAM-patch address is only known for this
@@ -20,7 +19,7 @@ use std::time::{Duration, Instant};
 /// Progress events for CLI/GUI.
 #[derive(Debug, Clone)]
 pub enum Progress {
-    /// A protocol line (the "==> ..." of the bash v1).
+    /// A human-readable progress line.
     Step(String),
     PartitionStart {
         name: String,
