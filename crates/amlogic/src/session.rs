@@ -26,6 +26,13 @@ pub const MEDIA_CHUNK: usize = 0x10000;
 pub const MEDIA_ACK_LEN: usize = 0x200;
 /// Bulk reply length of bulkcmd/tpl status (AM_BULK_REPLY_LEN).
 pub const BULK_REPLY_LEN: usize = 512;
+/// Checksum algorithm id carried by the media head (u16 at 0x10):
+/// 0xef selects the add_sum algorithm.
+const MEDIA_ALG_ADDSUM: u16 = 0x00ef;
+/// Ack length announced in the media head (u16 at 0x12). The vendor 1.5
+/// tool — the one proven against this board — announces 0x100; 1.7.5 and
+/// pyamlboot announce 0x200 and read 512-byte acks.
+const MEDIA_ACK_ANNOUNCED: u16 = 0x0100;
 /// The device truncates a bulkcmd payload at 64 bytes silently; keep
 /// the string + NUL within that (flasher.sh BULKCMD_MAX = 63).
 pub const BULKCMD_MAX: usize = 63;
@@ -44,8 +51,19 @@ const MEDIA_CONTINUE_PAUSE: Duration = Duration::from_millis(500);
 const COMMAND_CONTINUE_PAUSE: Duration = Duration::from_secs(3);
 /// Fallback pause for another `Continue:xx` code.
 const CONTINUE_PAUSE: Duration = Duration::from_millis(50);
-/// Overall status deadline; the spec gives a 60 s TPL status window.
+/// Overall status deadline of the TPL status poll (the spec gives a
+/// 60 s TPL status window).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Overall wall clock of a burning-command status poll: the vendor
+/// tool polls bulk status for 20 minutes (update 1.5 AmlUsbBulkCmd,
+/// `0x124F80` ms in the binary).
+const BULK_STATUS_DEADLINE: Duration = Duration::from_secs(20 * 60);
+/// Wall clock of one media-chunk ack attempt: the vendor tool waits
+/// 12 minutes for `OK!!` (AmlWriteMedia, `0xAFC80` ms).
+const MEDIA_STATUS_DEADLINE: Duration = Duration::from_secs(12 * 60);
+/// Pause before re-reading after an EMPTY bulk status reply (1.7.5
+/// `bulkcmd reply 0, retry it`; 1.5 fails the command instead).
+const EMPTY_REPLY_PAUSE: Duration = Duration::from_millis(500);
 /// Identify is a 5 s request (spec §18).
 const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 /// EP0 memory read/write are 5 s requests (spec §18).
@@ -85,7 +103,9 @@ impl<T: Transport> AmlogicSession<T> {
 impl AmlogicSession<crate::NusbTransport> {
     /// USB port reset (see [`NusbTransport::reset`]): the
     /// session handle dies, the device re-enumerates into a fresh
-    /// download window. Part of the automatic dump cycle.
+    /// download window. An experiment knob of the `aml cycle`
+    /// passthrough; the dump cycle itself re-catches the window after a
+    /// manual power cycle, like the reference flasher.
     pub fn reset(&self) -> Result<()> {
         self.transport.reset()
     }
@@ -387,14 +407,37 @@ impl<T: Transport> AmlogicSession<T> {
         let start = Instant::now();
         let mut first = true;
         poll_status(
+            BULK_STATUS_DEADLINE,
             || {
                 let timeout = if first { first_status } else { STATUS_TIMEOUT };
                 first = false;
-                self.read_bulk_reply_timeout(timeout)
+                self.read_bulk_reply_optional(timeout)
             },
             || start.elapsed(),
             sleep,
         )
+    }
+
+    /// One 512-byte bulk-IN status reply, NUL-trimmed; `Ok(None)` on an
+    /// empty reply — the 1.7.5 tool re-polls after 500 ms instead of
+    /// failing ("bulkcmd reply 0, retry it").
+    fn read_bulk_reply_optional(&mut self, timeout: Duration) -> Result<Option<String>> {
+        let mut buf = [0u8; BULK_REPLY_LEN];
+        let n = self
+            .transport
+            .bulk_read_upto_timeout(self.ep_in, &mut buf, timeout)?;
+        if n == 0 {
+            log::debug!("amlogic: bulkcmd reply 0 — retrying");
+            return Ok(None);
+        }
+        if n > buf.len() {
+            return Err(Error::InvalidResponse(format!(
+                "invalid bulk status length: {n}"
+            )));
+        }
+        let text = nul_trim(&buf[..n]);
+        log::debug!("amlogic: bulk reply {n}b: {text}");
+        Ok(Some(text))
     }
 
     /// One 512-byte bulk-IN status reply, NUL-trimmed. Read UP TO 512 in
@@ -442,6 +485,7 @@ impl<T: Transport> AmlogicSession<T> {
     pub fn tpl_stat(&mut self) -> Result<String> {
         let start = Instant::now();
         poll_status(
+            COMMAND_TIMEOUT,
             || {
                 let mut buf = [0u8; 0x40];
                 let n = self.ctrl_in_timeout(req::TPL_STAT, 0, 0, &mut buf, TPL_STAT_TIMEOUT)?;
@@ -450,7 +494,7 @@ impl<T: Transport> AmlogicSession<T> {
                         "invalid TPL status length: {n}"
                     )));
                 }
-                Ok(nul_trim(&buf[..n]))
+                Ok(Some(nul_trim(&buf[..n])))
             },
             || start.elapsed(),
             sleep,
@@ -463,26 +507,47 @@ impl<T: Transport> AmlogicSession<T> {
     /// device acknowledges on bulk-IN with `OK!!`. Prerequisite: a
     /// `download <store|mem|dtb> <part> <type> <total_size>` command has
     /// armed the transfer.
+    ///
+    /// Head layout of the vendor tool, disassembled from update 1.5 (the
+    /// build proven against this board) and identical in structure in
+    /// 1.7.5 (tools/update-macos): attempt 0..2, chunk length, add_sum
+    /// of the chunk at 0x08, chunk index at 0x0c, then a u32 at 0x10
+    /// that is not a magic but two u16 halves: the checksum algorithm
+    /// (0xef = add_sum) and the ack length (0x100 in 1.5; 1.7.5 sends
+    /// `seq << 4` at 0x0c and ack length 0x200). A failed ack READ
+    /// retries the attempt like the vendor tool; failed control/bulk
+    /// sends abort immediately. One attempt owns a 12-minute ack budget.
     pub fn write_media(&mut self, data: &[u8], seq: u32) -> Result<()> {
         assert!(data.len() <= MEDIA_CHUNK, "packet must be <= MEDIA_CHUNK");
         if data.is_empty() {
             return Err(Error::InvalidArgument("empty media packet".into()));
         }
-        // Spec §16.2: attempt 0..2, block length, seq << 4, checksum,
-        // then `ef 00 00 01`, then zero padding. Retry a rejected block
-        // up to three times; `Continue:32` means "wait and read again".
         let mut last = String::new();
         for attempt in 0..3u32 {
             let mut head = [0u8; 0x20];
             head[0..4].copy_from_slice(&attempt.to_le_bytes());
             head[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
-            head[8..12].copy_from_slice(&(seq << 4).to_le_bytes());
-            head[12..16].copy_from_slice(&add_sum(data).to_le_bytes());
-            head[16..20].copy_from_slice(&0x0100_00efu32.to_le_bytes());
+            head[8..12].copy_from_slice(&add_sum(data).to_le_bytes());
+            head[12..16].copy_from_slice(&seq.to_le_bytes());
+            head[16..18].copy_from_slice(&MEDIA_ALG_ADDSUM.to_le_bytes());
+            head[18..20].copy_from_slice(&MEDIA_ACK_ANNOUNCED.to_le_bytes());
             self.ctrl_out_timeout(req::WRITE_MEDIA, 1, 0xffff, &head, MEDIA_TIMEOUT)?;
             self.transport.bulk_write(self.ep_out, data)?;
+            let started = Instant::now();
             loop {
-                let ack = self.read_bulk_reply()?;
+                if started.elapsed() >= MEDIA_STATUS_DEADLINE {
+                    last = "media ack timeout".into();
+                    break;
+                }
+                let ack = match self.read_bulk_reply() {
+                    Ok(ack) => ack,
+                    Err(e) => {
+                        // the vendor tool retries the attempt when the
+                        // ack READ fails (its usbReadFile error path)
+                        last = e.to_string();
+                        break;
+                    }
+                };
                 if ack.starts_with("Continue:") {
                     log::info!("amlogic: {ack} — waiting");
                     sleep(MEDIA_CONTINUE_PAUSE);
@@ -922,18 +987,32 @@ fn nul_trim(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
+/// Poll a status channel until a final reply, within `deadline` wall
+/// clock (the vendor tool: 20 min for bulk commands, 60 s for TPL
+/// status). The `read` closure returns `Ok(None)` for an empty reply,
+/// which is retried after [`EMPTY_REPLY_PAUSE`] (the 1.7.5 tool's
+/// behavior). `Continue:xx` polls again with the code-specific pause;
+/// `success`-prefixed text is the final status; anything else is the
+/// error text.
 fn poll_status(
-    mut read: impl FnMut() -> Result<String>,
+    deadline: Duration,
+    mut read: impl FnMut() -> Result<Option<String>>,
     mut elapsed: impl FnMut() -> Duration,
     mut pause: impl FnMut(Duration),
 ) -> Result<String> {
     loop {
-        if elapsed() >= COMMAND_TIMEOUT {
+        if elapsed() >= deadline {
             return Err(Error::CommandTimeout);
         }
-        let text = read()?;
+        let text = match read()? {
+            None => {
+                pause(EMPTY_REPLY_PAUSE);
+                continue;
+            }
+            Some(text) => text,
+        };
         let spent = elapsed();
-        if spent >= COMMAND_TIMEOUT {
+        if spent >= deadline {
             return Err(Error::CommandTimeout);
         }
         if text.starts_with("Continue:") {
@@ -945,7 +1024,7 @@ fn poll_status(
             } else {
                 CONTINUE_PAUSE
             };
-            pause(wait.min(COMMAND_TIMEOUT - spent));
+            pause(wait.min(deadline - spent));
         } else if text.starts_with("success") {
             return Ok(text);
         } else {
@@ -964,13 +1043,14 @@ mod tests {
         let elapsed = Cell::new(Duration::ZERO);
         let reads = Cell::new(0);
         let result = poll_status(
+            COMMAND_TIMEOUT,
             || {
                 reads.set(reads.get() + 1);
-                Ok(if elapsed.get() > Duration::from_secs(60) {
+                Ok(Some(if elapsed.get() > Duration::from_secs(60) {
                     "success".into()
                 } else {
                     "Continue:34".into()
-                })
+                }))
             },
             || elapsed.get(),
             |delay| elapsed.set(elapsed.get() + delay),
@@ -984,13 +1064,35 @@ mod tests {
     fn late_status_success_does_not_escape_deadline() {
         let elapsed = Cell::new(Duration::ZERO);
         let result = poll_status(
+            COMMAND_TIMEOUT,
             || {
                 elapsed.set(Duration::from_secs(61));
-                Ok("success".into())
+                Ok(Some("success".into()))
             },
             || elapsed.get(),
             |_| unreachable!("a late reply must not trigger another pause"),
         );
         assert!(matches!(result, Err(Error::CommandTimeout)));
+    }
+
+    /// An empty bulk status reply is retried after 500 ms, as the 1.7.5
+    /// vendor tool does (`bulkcmd reply 0, retry it`).
+    #[test]
+    fn empty_reply_is_retried_until_success() {
+        let reads = Cell::new(0);
+        let paused = Cell::new(Duration::ZERO);
+        let result = poll_status(
+            BULK_STATUS_DEADLINE,
+            || {
+                let n = reads.get();
+                reads.set(n + 1);
+                if n < 2 { Ok(None) } else { Ok(Some("success".into())) }
+            },
+            || paused.get(),
+            |delay| paused.set(paused.get() + delay),
+        );
+        assert_eq!(result.unwrap(), "success");
+        assert_eq!(reads.get(), 3);
+        assert_eq!(paused.get(), Duration::from_millis(1000));
     }
 }

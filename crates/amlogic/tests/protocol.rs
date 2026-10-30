@@ -218,15 +218,19 @@ fn bulk_cmd_too_long_rejected_before_the_bus() {
     assert_eq!(s.transport().pos, 0); // nothing was sent
 }
 
-/// Media write (download packet): 32-byte head with the spec §16.2
-/// layout — attempt, length, seq << 4, add_sum, `ef 00 00 01`, zeros.
+/// Media write (download packet): the 32-byte head of the vendor tool
+/// (disassembled from update 1.5, the build proven against this board):
+/// attempt, length, add_sum at 0x08, chunk index at 0x0c, then u16
+/// checksum-algorithm id (0xef = add_sum) + u16 announced ack length
+/// (0x100; the 1.7.5 build announces 0x200).
 fn media_head(data: &[u8], seq: u32, attempt: u32) -> Vec<u8> {
     let mut head = [0u8; 0x20];
     head[0..4].copy_from_slice(&attempt.to_le_bytes());
     head[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
-    head[8..12].copy_from_slice(&(seq << 4).to_le_bytes());
-    head[12..16].copy_from_slice(&amlogic::add_sum(data).to_le_bytes());
-    head[16..20].copy_from_slice(&0x0100_00efu32.to_le_bytes());
+    head[8..12].copy_from_slice(&amlogic::add_sum(data).to_le_bytes());
+    head[12..16].copy_from_slice(&seq.to_le_bytes());
+    head[16..18].copy_from_slice(&0x00efu16.to_le_bytes());
+    head[18..20].copy_from_slice(&0x0100u16.to_le_bytes());
     head.to_vec()
 }
 
@@ -280,6 +284,23 @@ fn write_media_rejects_after_three_attempts() {
     let err = s.write_media(&data, 0).unwrap_err();
     assert!(err.to_string().contains("genSum"));
     assert_eq!(s.transport().pos, 9);
+}
+
+/// A dead ack pipe retries the attempt, like the vendor tool's
+/// usbReadFile error path does.
+#[test]
+fn write_media_retries_when_the_ack_read_fails() {
+    let data = vec![1u8; 16];
+    let mut s = session(vec![
+        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, media_head(&data, 3, 0)),
+        Step::BulkOut(data.clone()),
+        Step::BulkError("iokit death".into()),
+        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, media_head(&data, 3, 1)),
+        Step::BulkOut(data.clone()),
+        Step::BulkIn(media_ack("OK!!")),
+    ]);
+    s.write_media(&data, 3).unwrap();
+    assert_eq!(s.transport().pos, 6);
 }
 
 /// Media streaming chunks a large buffer into MEDIA_CHUNK packets.
@@ -592,6 +613,19 @@ fn bulk_cmd_short_reply_accepted() {
         Step::BulkIn(b"success\0".to_vec()),
     ]);
     let status = s.bulk_cmd("low_power").unwrap();
+    assert_eq!(status, "success");
+}
+
+/// An empty bulk status reply is retried (1.7.5 `bulkcmd reply 0,
+/// retry it`), not failed.
+#[test]
+fn bulk_cmd_empty_reply_retried() {
+    let mut s = session(vec![
+        Step::ControlOut(req::BULKCMD, 0, 2, bulkcmd("disk_initial 0")),
+        Step::BulkIn(Vec::new()),
+        Step::BulkIn(b"success\0".to_vec()),
+    ]);
+    let status = s.bulk_cmd("disk_initial 0").unwrap();
     assert_eq!(status, "success");
 }
 

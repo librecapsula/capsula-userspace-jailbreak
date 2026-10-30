@@ -271,14 +271,18 @@ fn tpl_identification_primes_after_identify() {
 
 #[test]
 fn malformed_prime_status_is_not_retried_as_a_pipe_failure() {
+    // An empty reply re-reads the pipe (1.7.5 `bulkcmd reply 0, retry
+    // it`) instead of resending the command or declaring the pipe dead;
+    // the next text, whatever it says, is the reply — and the prime
+    // accepts it: the pipe works, the sacrificial reply is meaningless.
     let mut steps = vec![
         Step::ControlOut(req::BULKCMD, 0, 2, command("echo")),
         Step::BulkIn(vec![]),
+        Step::BulkIn(b"garbage\0".to_vec()),
     ];
-    steps.extend(armed("echo"));
     let mut s = session(steps);
-    assert!(s.prime().is_err());
-    assert_eq!(s.transport().pos, 2);
+    assert!(s.prime().is_ok());
+    assert_eq!(s.transport().pos, 3);
 }
 
 #[test]

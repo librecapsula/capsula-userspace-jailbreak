@@ -54,6 +54,23 @@ impl<T: Transport> AmlogicSession<T> {
         self.stage_nand(offset, main_bytes, true)
     }
 
+    /// `nand erase <off> <len>` — стирание диапазона логического
+    /// пространства. Идемпотентно: прерванное окно просто повторяет
+    /// команду в следующем. Границы — кратные странице.
+    pub fn nand_erase(&mut self, offset: u32, len: u32) -> Result<()> {
+        if len == 0
+            || !offset.is_multiple_of(PAGE_SIZE)
+            || !len.is_multiple_of(PAGE_SIZE)
+            || offset as u64 + len as u64 > NAND_SIZE as u64
+        {
+            return Err(Error::InvalidArgument(
+                "NAND erase outside A113X geometry".into(),
+            ));
+        }
+        self.bulk_cmd(&format!("echo; nand erase {offset:#x} {len:#x}"))
+            .map(|_| ())
+    }
+
     pub fn read_nand_buffer(&mut self, bytes: usize) -> Result<Vec<u8>> {
         let max = raw_bytes(CHUNK_SIZE)?;
         if bytes == 0 || bytes > max || RAM_SCRATCH as u64 + bytes as u64 > 0x0190_0000 {

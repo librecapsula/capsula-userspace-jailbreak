@@ -246,6 +246,20 @@ impl CaptureDirectory {
         ))
     }
 
+    /// Переоткрыть каталог идущего захвата (чекпоинт-цикл по окнам:
+    /// манифест и .partial-файлы — состояние между окнами).
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        if !std::fs::symlink_metadata(path)?.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "capture directory is missing",
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }

@@ -6,9 +6,14 @@
 //! - device side: u-boot `drivers/usb/gadget/v2_burning/` (2015.01
 //!   vendor trees) and the BootROM requests documented in pyamlboot
 //!   `PROTOCOL.md` (github.com/superna9999/pyamlboot);
-//! - host side reference: pyamlboot (`pyamlboot.py`, `optimus.py`);
+//! - host side references: pyamlboot (`pyamlboot.py`, `optimus.py`) and
+//!   the vendor `update` tool — 1.5 (the build proven on this board,
+//!   `../update`) disassembled, 1.7.5 rebuilt in `../tools/update-macos`;
 //! - timeouts, headers and status strings per the reverse-engineered
 //!   «Amlogic A113X USB Protocol Specification» (AML-A113X-USB-1.0).
+//!   The media-transfer head and the store write flow follow the 1.5
+//!   tool byte-for-byte (sum at 0x08, chunk index at 0x0c, alg 0xef +
+//!   ack length 0x100 at 0x10).
 //!
 //! The USB transport ([`Transport`]/[`NusbTransport`]) lives in this
 //! crate: the Amlogic protocol needs per-request control deadlines,
