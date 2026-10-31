@@ -40,6 +40,7 @@
 
 #![warn(missing_docs)]
 
+pub mod check;
 pub mod compress;
 pub mod crc;
 pub mod devtable;

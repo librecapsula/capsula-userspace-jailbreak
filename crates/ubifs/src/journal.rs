@@ -94,7 +94,8 @@ pub fn parse(
     }
 
     let mut j = Journal::default();
-    let mut lnum = master.log_lnum;
+    let head_lnum = master.log_lnum;
+    let mut lnum = head_lnum;
     while let Some(leb) = lebs.leb(lnum) {
         let mut offs = 0usize;
         let mut first = true;
@@ -146,7 +147,14 @@ pub fn parse(
             offs += node.len().div_ceil(8) * 8;
         }
         if first {
-            break; // no CS found: the log ended
+            if lnum == head_lnum {
+                // The log head must always start with a CS node.
+                return Err(Error::BadNode(format!(
+                    "log head LEB {lnum} has no commit start node"
+                )));
+            }
+            // Beyond the head an empty LEB is the normal log end.
+            break;
         }
         lnum = if lnum == log_last {
             log_first
@@ -158,6 +166,12 @@ pub fn parse(
         }
     }
 
+    // The buds must live inside the volume (validate_ref).
+    for r in &j.refs {
+        if lebs.leb(r.lnum).is_none() {
+            return Err(Error::BadNode(format!("bud leb {} is unmapped", r.lnum)));
+        }
+    }
     // Scan the buds (in log order).
     for r in j.refs.clone() {
         scan_bud(lebs, r, &mut j.entries)?;
@@ -253,9 +267,10 @@ pub fn orphans(
         let Some(leb) = lebs.leb(lnum) else { continue };
         let mut offs = 0usize;
         while offs + UBIFS_ORPH_NODE_SZ <= leb.len() {
-            let Ok((node, ch)) = parse_node(&leb[offs..], leb.len() - offs, "orphan node") else {
-                break;
-            };
+            if leb[offs..offs + 4] == [0xFF; 4] {
+                break; // the area tail
+            }
+            let (node, ch) = parse_node(&leb[offs..], leb.len() - offs, "orphan node")?;
             if ch.node_type != UBIFS_ORPH_NODE {
                 break;
             }
