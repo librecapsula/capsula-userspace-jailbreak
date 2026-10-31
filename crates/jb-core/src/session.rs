@@ -1,13 +1,15 @@
 //! Device bring-up and pipeline primitives shared by the operations.
 //!
-//! Every regular-column operation runs over OUR usbplug loaded into RAM
-//! from the OTA loader: the RAM-patch address is only known for this
-//! build, so the DRAM signatures are always verified.
+//! Every regular-column operation that reads the flash above the stock
+//! 32 MiB read mask (the full dump) runs over OUR usbplug loaded into
+//! RAM from the OTA loader: the RAM-patch address is only known for
+//! this build, so the DRAM signatures are always verified.
 //!
-//! First-generation columns never get there (their BootROM rejects the
-//! loader); for them bring-up returns the stock u-boot rockusb loader
-//! (330d with a gift serial), and the caller runs the no-backup
-//! userdata flow.
+//! When nothing above the mask is read, the stock u-boot rockusb loader
+//! (330d) is enough (GPT lives at LBA 1, userdata goes through the
+//! stock WRITE_LBA), so bring-up keeps it: first-generation columns
+//! (their locked BootROM rejects our loader anyway) and `--no-backup`
+//! runs. The caller then runs the no-backup userdata flow.
 
 use crate::config::Config;
 use crate::firstgen::is_first_generation;
@@ -65,7 +67,10 @@ pub enum BringUpError {
 /// The live device session after bring-up. `firstgen`: first
 /// generation — the persona is the stock u-boot rockusb loader (330d
 /// with a gift serial); a full backup is impossible on that hardware,
-/// userdata is written through the stock WRITE_LBA.
+/// userdata is written through the stock WRITE_LBA. For `--no-backup`
+/// runs the session is the stock loader too (regular columns included):
+/// nothing above the stock read mask is ever read, so our usbplug is
+/// not downloaded.
 pub struct BroughtUp<T: Transport> {
     pub session: LoaderSession<T>,
     /// The column identity serial for the backup key. Read exactly once
@@ -187,7 +192,9 @@ fn refuse_unknown_identity(wait_loader: &mut Option<Instant>, progress: Progress
 ///
 /// - Loader (330d) with a regular serial: reset into MaskROM and load
 ///   our loader (the RAM-patch constants do not apply to the stock
-///   u-boot usbplug);
+///   u-boot usbplug) — unless `no_backup`: that run never reads above
+///   the stock read mask (the dump is skipped), so the stock loader
+///   itself is returned and the MaskROM round-trip is skipped;
 /// - Loader (330d) with a first-generation serial: the stock loader
 ///   itself — `firstgen = true` (our loader would be rejected by its
 ///   locked BootROM);
@@ -199,6 +206,7 @@ pub fn bring_up<B: Bus>(
     config: &Config,
     loader: &LoaderContainer,
     wait: Option<Duration>,
+    no_backup: bool,
     progress: ProgressFn,
 ) -> Result<BroughtUp<B::T>, BringUpError> {
     let hint = &config.hint.text;
@@ -229,9 +237,9 @@ pub fn bring_up<B: Bus>(
             rockusb::DeviceMode::Loader => {
                 // Read the identity exactly once, BEFORE the MaskROM
                 // reset consumes the persona. A first-generation serial
-                // also switches the whole scenario: its locked BootROM
-                // will refuse our usbplug, and the reset itself would
-                // kick the running stock loader — keep it instead.
+                // or a --no-backup run also switches the whole scenario
+                // to the stock loader: the reset itself would kick the
+                // running stock loader — keep it instead.
                 if serial.is_none() {
                     serial = Some(normalize_serial(bus.loader_serial()));
                 }
@@ -245,12 +253,21 @@ pub fn bring_up<B: Bus>(
                     continue;
                 }
                 let serial = serial.clone().unwrap();
-                if is_first_generation(&serial) {
-                    let session = attach_stock_loader(bus, progress)?;
+                let firstgen = is_first_generation(&serial);
+                // Both stay on the stock loader: first generation
+                // cannot run our usbplug at all, and a --no-backup run
+                // never reads above the stock read mask.
+                if firstgen || no_backup {
+                    let why = if firstgen {
+                        "первое поколение"
+                    } else {
+                        "--no-backup"
+                    };
+                    let session = attach_stock_loader(bus, progress, why)?;
                     return Ok(BroughtUp {
                         session,
                         serial,
-                        firstgen: true,
+                        firstgen,
                     });
                 }
                 // Sanity-check the pipe over one session and reset into
@@ -331,15 +348,19 @@ pub fn bring_up<B: Bus>(
     }
 }
 
-/// Open and sanity-check the stock rockusb loader of a first-generation
-/// column (330d with a gift serial).
+/// Open and sanity-check the stock rockusb loader (330d) and keep it as
+/// the session. `why` names the flow in the progress line: a
+/// first-generation column (its locked BootROM rejects our usbplug) or
+/// a --no-backup run (nothing above the stock read mask is ever read,
+/// so the MaskROM round-trip is pointless).
 fn attach_stock_loader<B: Bus>(
     bus: &mut B,
     progress: ProgressFn,
+    why: &str,
 ) -> rockusb::Result<LoaderSession<B::T>> {
-    progress(Progress::Step(
-        "первое поколение: работаю через стоковый лоадер (330d)".into(),
-    ));
+    progress(Progress::Step(format!(
+        "{why}: работаю через стоковый лоадер (330d)"
+    )));
     let mut s = bus.open_loader()?;
     if let Err(e) = s.ready() {
         return Err(UsbError::WrongMode(format!(

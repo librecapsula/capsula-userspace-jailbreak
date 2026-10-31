@@ -454,7 +454,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jb-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "amlogic",
  "anyhow",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "jb-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "amlogic",
  "anyhow",
@@ -672,7 +672,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rockusb"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "env_logger",
  "hex",
@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "win-drv"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "windows-sys 0.59.0",

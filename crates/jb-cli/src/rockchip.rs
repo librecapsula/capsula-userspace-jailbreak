@@ -26,16 +26,19 @@ use std::time::Duration;
 const GADGET_STABLE: Duration = Duration::from_secs(10);
 
 /// The live device as the flow sees it (after bring-up). The `firstgen`
-/// flag selects the path inside the shared flow: first generation works
-/// over the stock loader and has no backup.
+/// flag selects the path inside the shared flow: first generation and
+/// --no-backup runs work over the stock loader (330d); on first
+/// generation the backup is NOT intact (0xCC above the 32 MiB read
+/// mask) and userdata is always built from scratch.
 struct Device {
     session: rockusb::LoaderSession<NusbTransport>,
     serial: String,
     /// First generation: the stock u-boot rockusb loader (330d) with a
-    /// gift serial — no backup possible, userdata is built from scratch.
+    /// gift serial — the dump above the 32 MiB read mask is 0xCC,
+    /// userdata is built from scratch.
     firstgen: bool,
     /// A fresh backup was taken this run (false = a verified backup for
-    /// this serial already existed, or first generation).
+    /// this serial already existed, or --no-backup).
     dumped: bool,
 }
 
@@ -96,14 +99,13 @@ impl Backend for Rockchip {
 
     fn backup(&mut self, wait: Option<Duration>) -> anyhow::Result<()> {
         let dev = dump_all(wait, &self.config, &mut self.drivers, false)?;
+        let where_ = backup_dir(&dev.serial).display().to_string();
         if dev.firstgen {
-            bail!(
-                "первое поколение: полный дамп невозможен (BootROM залочен). \
-                 Запустите инструмент без подкоманды — он прошьёт оверлей adbd \
-                 без бэкапа"
+            println!(
+                "первое поколение: полный дамп невозможен (BootROM залочен) — \
+                 читаемы только разделы ниже 32 МиБ, дамп НЕцелостный"
             );
         }
-        let where_ = backup_dir(&dev.serial).display().to_string();
         if dev.dumped {
             println!(
                 "готово: дампы {} — в {where_} (на колонку не писалось)",
@@ -111,8 +113,8 @@ impl Backend for Rockchip {
             );
         } else {
             println!(
-                "валидный бэкап {} уже есть в {where_} — делать нечего \
-                 (удалите каталог, чтобы снять дамп заново)",
+                "бэкап {} уже есть в {where_} — делать нечего (удалите \
+                 каталог, чтобы снять дамп заново)",
                 dev.serial
             );
         }
@@ -125,9 +127,12 @@ fn backup_dir(serial: &str) -> PathBuf {
     Path::new("backup").join(BackupStore::dir_name(serial))
 }
 
-/// Steps 1-3 (loader, device, full dump into backup/) for regular
-/// columns; for first-generation personas the same session mechanics,
-/// but no backup — that hardware cannot run our usbplug.
+/// Steps 1-3 (loader, device, dump into backup/) — one flow for regular
+/// columns and first generation; --no-backup skips the dump entirely.
+/// On a regular column the session runs our usbplug with the read-limit
+/// patch (fully readable dump); on first generation it stays on the
+/// stock loader (330d) and the dump is NOT intact: everything above
+/// the 32 MiB read mask reads back as 0xCC.
 ///
 /// On Windows the board hops between devnodes (330d loader, 330e
 /// MaskROM/usbplug) and a fresh devnode may be grabbed by a vendor
@@ -212,7 +217,7 @@ fn dump_all_once(
     let p = CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
     let mut bus = jb_core::session::UsbBus;
-    let up = match bring_up(&mut bus, config, &loader, wait, &progress) {
+    let up = match bring_up(&mut bus, config, &loader, wait, no_backup, &progress) {
         Ok(v) => v,
         Err(BringUpError::LoaderRejected) => bail!(
             "usbplug не запустился: BootROM отклонил лоадер (неподдерживаемая \
@@ -222,23 +227,15 @@ fn dump_all_once(
         Err(e) => return Err(e.into()),
     };
 
-    // First generation: no backup on that hardware — straight to the
-    // userdata write.
-    if up.firstgen {
-        return Ok(Device {
-            session: up.session,
-            serial: up.serial,
-            firstgen: true,
-            dumped: false,
-        });
-    }
-
     let serial = up.serial;
+    let firstgen = up.firstgen;
     let mut s = up.session;
     println!("серийник колонки: {serial}");
     let dir = backup_dir(&serial);
     // A verified backup of THIS column exists -> skip the dump
-    // and go straight to the userdata write.
+    // and go straight to the userdata write. On the stock loader
+    // (first generation) the dump is NOT intact: everything above
+    // the 32 MiB read mask goes in as 0xCC — backup() says so itself.
     let dumped = if no_backup {
         println!(
             "--no-backup: бэкап не проверяю и не снимаю — userdata будет \
@@ -247,21 +244,21 @@ fn dump_all_once(
         false
     } else if BackupStore::exists_verified(&dir) {
         println!(
-            "валидный бэкап уже есть в {} — дамп пропускаю (удалите \
-             каталог, чтобы снять заново)",
+            "бэкап уже есть в {} — дамп пропускаю (удалите каталог, чтобы \
+             снять заново)",
             dir.display()
         );
         false
     } else {
-        backup::backup(&mut s, config, &dir, &progress)
-            .with_context(|| format!("колонка {serial}: полный дамп"))?;
+        backup::backup(&mut s, config, &dir, &progress, firstgen)
+            .with_context(|| format!("колонка {serial}: дамп"))?;
         let _ = std::fs::write(dir.join("serial.txt"), &serial);
         true
     };
     Ok(Device {
         session: s,
         serial,
-        firstgen: false,
+        firstgen,
         dumped,
     })
 }
@@ -280,7 +277,8 @@ fn write_userdata(
 ) -> anyhow::Result<()> {
     if dev.firstgen {
         println!(
-            "первое поколение {} (стоковый лоадер): полный бэкап НЕВОЗМОЖЕН.",
+            "первое поколение {} (стоковый лоадер): бэкап нецелостный \
+             (маска 0xCC выше 32 МиБ), userdata будет собран с нуля",
             dev.serial
         );
     }
@@ -358,8 +356,9 @@ fn confirm_write(
         return Ok(());
     }
     let mode = if firstgen {
-        "оверлей adbd на чистый ext2 — бэкапа на первом поколении нет, \
-         текущее содержимое теряется"
+        "оверлей adbd на чистый ext2 — бэкап первого поколения нецелостный \
+         (0xCC выше 32 МиБ), userdata собирается с нуля, содержимое \
+         теряется"
     } else if no_backup {
         "оверлей adbd на чистый ext2 (--no-backup: бэкап не снимался, \
          текущее содержимое теряется)"

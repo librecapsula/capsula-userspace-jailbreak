@@ -21,7 +21,9 @@ pub struct BackupReport {
     pub out_dir: std::path::PathBuf,
     pub partitions: usize,
     pub sectors_total: u64,
-    pub read_limit_old: u32,
+    /// The limit value before the RAM patch; None when running on the
+    /// stock loader (first generation) — there is no patch there.
+    pub read_limit_old: Option<u32>,
 }
 
 /// Patch the usbplug read limit in RAM: without it,
@@ -81,15 +83,30 @@ pub fn cc_guard<T: Transport>(
 }
 
 /// Back up every partition into `out_dir` (v1-compatible layout).
-/// The caller has done bring_up(Purpose::Backup): signatures verified.
+/// The caller has done bring_up: signatures verified.
+///
+/// On `stock_loader` (first generation, 330d u-boot) neither the RAM
+/// patch nor the guard is possible: everything above the stock read
+/// limit reads back as 0xCC. Those partitions still go into the dump
+/// full-size, filled with what the device returned (garbage), and the
+/// run ends with a NOT-intact warning. Caveat: the behavior of a
+/// READ_LBA spanning the mask boundary (boot_b) is unmeasured — its
+/// file gets the real prefix and/or 0xCC; the tail is not intact
+/// either way, the generic warning covers it.
 pub fn backup<T: Transport>(
     s: &mut LoaderSession<T>,
     config: &Config,
     out_dir: &Path,
     progress: ProgressFn,
+    stock_loader: bool,
 ) -> rockusb::Result<BackupReport> {
-    let old_limit = patch_read_limit(s, config, progress)?;
-    cc_guard(s, progress)?;
+    let old_limit = if stock_loader {
+        None
+    } else {
+        let old = patch_read_limit(s, config, progress)?;
+        cc_guard(s, progress)?;
+        Some(old)
+    };
 
     let (gpt, gpt_raw) = read_gpt(s, progress)?;
 
@@ -109,6 +126,7 @@ pub fn backup<T: Transport>(
         info.sector_total
     )));
 
+    let mut masked: Vec<String> = Vec::new();
     for e in &gpt.entries {
         let file_name = crate::backup_store::BackupStore::image_name(e.idx, &e.name);
         let path = out_dir.join(&file_name);
@@ -116,6 +134,16 @@ pub fn backup<T: Transport>(
             name: e.name.clone(),
             sectors: e.sectors,
         });
+        // On the stock loader everything from GUARD_LBA up reads back
+        // as 0xCC: a partition fully above the mask dumps as garbage,
+        // a straddling one (boot_b) keeps only its prefix below it.
+        if stock_loader && e.first_lba + e.sectors > GUARD_LBA as u64 {
+            masked.push(e.name.clone());
+            progress(Progress::Step(format!(
+                "{}: выше маски чтения — в дампе 0xCC",
+                e.name
+            )));
+        }
         let mut out = std::fs::File::create(&path)?;
         let mut hasher = Sha256::new();
         // one reusable full-chunk buffer; the last chunk of a partition
@@ -128,7 +156,11 @@ pub fn backup<T: Transport>(
                 UsbError::Loader(format!("{}: LBA за пределами u32-протокола", e.name))
             })?;
             s.read_lba(lba, &mut chunk[..n * 512])?;
-            if done == 0 && chunk[..512].iter().all(|&b| b == 0xcc) {
+            // In usbplug mode a 0xCC first sector means the mask is
+            // still active (the patch failed) — the whole dump would be
+            // garbage. On the stock loader it is the expected content
+            // of a masked partition; the mask accounting above covers it.
+            if !stock_loader && done == 0 && chunk[..512].iter().all(|&b| b == 0xcc) {
                 let _ = std::fs::remove_file(&path);
                 return Err(UsbError::WrongMode(format!(
                     "{}: весь 0xCC — маска активна, дамп негоден",
@@ -159,6 +191,14 @@ pub fn backup<T: Transport>(
         progress(Progress::PartitionDone {
             name: e.name.clone(),
         });
+    }
+
+    if !masked.is_empty() {
+        progress(Progress::Step(format!(
+            "внимание: бэкап НЕцелостный — выше LBA {GUARD_LBA:#x} (32 МиБ) \
+             стоковый лоадер отдаёт 0xCC: {}",
+            masked.join(", ")
+        )));
     }
 
     std::fs::write(

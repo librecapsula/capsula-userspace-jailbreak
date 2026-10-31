@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     let config = Config::embedded();
     let loader = jb_core::loader::embedded()?;
     let mut bus = UsbBus;
-    let up = match bring_up(&mut bus, &config, &loader, None, &|_| {}) {
+    let up = match bring_up(&mut bus, &config, &loader, None, false, &|_| {}) {
         Ok(v) => v,
         Err(BringUpError::LoaderRejected) => anyhow::bail!("BootROM rejected the loader"),
         Err(e) => return Err(e.into()),

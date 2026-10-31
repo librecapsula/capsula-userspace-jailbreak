@@ -1,6 +1,7 @@
 //! Scenario tests for the bring_up state machine over a scripted bus
 //! (Bus + MockTransport): the regular path, first generation, unknown
-//! serials, a leftover usbplug and a rejected usbplug — no hardware.
+//! serials, a leftover usbplug, a rejected usbplug and --no-backup —
+//! no hardware.
 
 use jb_core::config::Config;
 use jb_core::session::{bring_up, BringUpError, Bus, Progress};
@@ -165,7 +166,7 @@ fn signature_steps(config: &Config) -> Vec<Step> {
     ]
 }
 
-/// Loader-session scenario for the first-generation stock-loader probe
+/// Loader-session scenario for the stock-loader probe
 /// (attach_stock_loader: TEST_UNIT_READY only, no reset).
 fn stock_probe_steps() -> Vec<Step> {
     vec![
@@ -264,7 +265,10 @@ impl Bus for FakeBus {
     }
 }
 
-fn run(bus: &mut FakeBus) -> Result<jb_core::session::BroughtUp<MockTransport>, BringUpError> {
+fn run(
+    bus: &mut FakeBus,
+    no_backup: bool,
+) -> Result<jb_core::session::BroughtUp<MockTransport>, BringUpError> {
     let config = Config::embedded();
     let loader = synth_loader();
     let progress = |_: Progress| {};
@@ -273,6 +277,7 @@ fn run(bus: &mut FakeBus) -> Result<jb_core::session::BroughtUp<MockTransport>, 
         &config,
         &loader,
         Some(Duration::from_secs(30)),
+        no_backup,
         &progress,
     )
 }
@@ -296,7 +301,7 @@ fn regular_column_goes_through_maskrom_to_usbplug() {
     ])
     .with_maskrom(maskrom_download_steps());
 
-    let up = run(&mut bus).expect("bring-up");
+    let up = run(&mut bus, false).expect("bring-up");
     assert!(!up.firstgen);
     assert_eq!(up.serial, REGULAR_SERIAL);
     // the identity is read exactly once, at the loader persona
@@ -308,10 +313,26 @@ fn first_generation_sticks_to_the_stock_loader() {
     let mut bus = FakeBus::new(vec![Some(DeviceMode::Loader)], GIFT_SERIAL)
         .with_loader(vec![stock_probe_steps()]);
 
-    let up = run(&mut bus).expect("bring-up");
+    let up = run(&mut bus, false).expect("bring-up");
     assert!(up.firstgen);
     assert_eq!(up.serial, GIFT_SERIAL);
     // no MaskROM reset ever happens on the first-generation path
+    assert_eq!(bus.serial_reads, 1);
+}
+
+/// A --no-backup run keeps the stock 330d session for a REGULAR serial
+/// too: no MaskROM reset, no download, no signature probes — the run
+/// never reads above the stock read mask. The scripted loader scenario
+/// (probe only, no reset CBW) fails the test if the regular path runs.
+#[test]
+fn no_backup_regular_column_sticks_to_the_stock_loader() {
+    let mut bus = FakeBus::new(vec![Some(DeviceMode::Loader)], REGULAR_SERIAL)
+        .with_loader(vec![stock_probe_steps()]);
+
+    let up = run(&mut bus, true).expect("bring-up");
+    // a regular column stays regular: only the transport differs
+    assert!(!up.firstgen);
+    assert_eq!(up.serial, REGULAR_SERIAL);
     assert_eq!(bus.serial_reads, 1);
 }
 
@@ -335,7 +356,7 @@ fn unreadable_serial_refuses_then_recovers_on_reentry() {
         serial_reads: 0,
     };
 
-    let up = run(&mut bus).expect("bring-up after re-entry");
+    let up = run(&mut bus, false).expect("bring-up after re-entry");
     assert!(!up.firstgen);
     assert_eq!(up.serial, REGULAR_SERIAL);
     assert_eq!(bus.serial_reads, 2);
@@ -358,7 +379,7 @@ fn leftover_usbplug_is_refused_until_loader_reentry() {
         serial_reads: 0,
     };
 
-    let up = run(&mut bus).expect("bring-up after re-entry");
+    let up = run(&mut bus, false).expect("bring-up after re-entry");
     assert!(!up.firstgen);
     // the usbplug persona never contributed a serial
     assert_eq!(bus.serial_reads, 1);
@@ -381,7 +402,7 @@ fn direct_maskrom_entry_without_serial_is_refused() {
         serial_reads: 0,
     };
 
-    let up = run(&mut bus).expect("bring-up after loader re-entry");
+    let up = run(&mut bus, false).expect("bring-up after loader re-entry");
     assert_eq!(up.serial, REGULAR_SERIAL);
     assert_eq!(bus.serial_reads, 1);
 }
@@ -397,7 +418,7 @@ fn usbplug_never_rising_is_loader_rejected() {
     // wait_mode: MaskROM after reset Ok, usbplug after download Err
     .with_wait_results(vec![true, false]);
 
-    let err = match run(&mut bus) {
+    let err = match run(&mut bus, false) {
         Ok(_) => panic!("usbplug never rose — bring_up must be rejected"),
         Err(e) => e,
     };
@@ -421,7 +442,7 @@ fn wrong_dram_signatures_fail_the_bring_up() {
     .with_loader(vec![probe_and_reset_steps(0x03), bad])
     .with_maskrom(maskrom_download_steps());
 
-    let err = match run(&mut bus) {
+    let err = match run(&mut bus, false) {
         Ok(_) => panic!("wrong signatures — bring_up must fail"),
         Err(e) => e,
     };

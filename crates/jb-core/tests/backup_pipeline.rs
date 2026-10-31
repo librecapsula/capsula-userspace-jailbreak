@@ -55,11 +55,10 @@ fn flash_info_reply(total: u32) -> Vec<u8> {
     v
 }
 
-/// Minimal GPT: 2 partitions (sec 512x1, data 513x3), entries at LBA2..6.
-fn build_gpt() -> Vec<u8> {
+/// Minimal GPT: entries (name, first_lba, last_lba), entries at LBA2..6.
+fn build_gpt_entries(entries: &[(&str, u64, u64)]) -> Vec<u8> {
     let mut data = vec![0u8; 34 * 512];
-    let entries: [(&str, u64, u64); 2] = [("sec", 512, 512), ("data", 513, 515)];
-    let mut blob = vec![0u8; 4 * 128];
+    let mut blob = vec![0u8; entries.len().max(4) * 128];
     for (i, (name, first, last)) in entries.iter().enumerate() {
         let e = &mut blob[i * 128..(i + 1) * 128];
         e[..16].copy_from_slice(&[0xaf; 16]); // type guid != 0
@@ -73,18 +72,29 @@ fn build_gpt() -> Vec<u8> {
     hdr[..8].copy_from_slice(b"EFI PART");
     hdr[12..16].copy_from_slice(&92u32.to_le_bytes()); // header size
     hdr[72..80].copy_from_slice(&2u64.to_le_bytes()); // entry lba
-    hdr[80..84].copy_from_slice(&4u32.to_le_bytes()); // 4 entries
+    hdr[80..84].copy_from_slice(&(entries.len().max(4) as u32).to_le_bytes());
     hdr[84..88].copy_from_slice(&128u32.to_le_bytes());
     // entries CRC
     let ecrc = crc32fast::hash(&blob);
     hdr[88..92].copy_from_slice(&ecrc.to_le_bytes());
     hdr[40..48].copy_from_slice(&34u64.to_le_bytes()); // first usable
-    hdr[48..56].copy_from_slice(&4000u64.to_le_bytes()); // last usable
+    hdr[48..56].copy_from_slice(
+        &entries
+            .last()
+            .map(|(_, _, l)| l + 16)
+            .unwrap_or(4000)
+            .to_le_bytes(), // last usable
+    );
     hdr[16..20].fill(0); // CRC field is zeroed for the header CRC
     let hcrc = crc32fast::hash(&hdr[..92]);
     hdr[16..20].copy_from_slice(&hcrc.to_le_bytes());
-    data[512..512 + 4 * 128].copy_from_slice(&blob);
+    data[512..512 + blob.len()].copy_from_slice(&blob);
     data
+}
+
+/// Minimal GPT: 2 partitions (sec 512x1, data 513x3), entries at LBA2..6.
+fn build_gpt() -> Vec<u8> {
+    build_gpt_entries(&[("sec", 512, 512), ("data", 513, 515)])
 }
 
 fn test_config() -> Config {
@@ -262,10 +272,10 @@ fn backup_pipeline_on_mock() {
 
     let out = std::env::temp_dir().join(format!("jb-backup-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
-    let report = backup(&mut s, &test_config(), &out, &|_| {}).expect("backup pipeline");
+    let report = backup(&mut s, &test_config(), &out, &|_| {}, false).expect("backup pipeline");
     assert_eq!(report.partitions, 2);
     assert_eq!(report.sectors_total, READ_LIMIT as u64);
-    assert_eq!(report.read_limit_old, 0x10000);
+    assert_eq!(report.read_limit_old, Some(0x10000));
 
     // the directory layout is compatible
     let sec = std::fs::read(out.join("01_sec.img")).unwrap();
@@ -367,7 +377,8 @@ fn backup_fails_on_cc_mask() {
     let mut s = LoaderSession::new(transport, EP_IN, EP_OUT);
     let out = std::env::temp_dir().join(format!("jb-cc-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
-    let err = backup(&mut s, &test_config(), &out, &|_| {}).expect_err("the mask must be caught");
+    let err = backup(&mut s, &test_config(), &out, &|_| {}, false)
+        .expect_err("the mask must be caught");
     assert!(err.to_string().contains("0xCC"), "{err}");
     let _ = std::fs::remove_dir_all(&out);
 }
@@ -455,4 +466,171 @@ fn write_partition_is_chunked_with_progress() {
     assert!(matches!(evs.last(), Some(Progress::PartitionDone { .. })));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stock loader (first generation): no RAM patch, no guard — the dump
+/// runs anyway. Partitions from GUARD_LBA up come back as 0xCC (fully
+/// above the mask) or lose their tail (straddling, boot_b-like); the
+/// store stays verifiable, the run must warn about it.
+#[test]
+fn backup_on_stock_loader_keeps_masked_partitions() {
+    use jb_core::session::Progress;
+
+    const GUARD: u64 = GUARD_LBA as u64;
+    let entries = [
+        ("low", 512, 514),             // fully below the mask
+        ("straddle", GUARD - 2, GUARD + 1), // crosses GUARD like boot_b
+        ("high", GUARD + 16, GUARD + 17),   // fully above the mask
+    ];
+    let gpt_raw = build_gpt_entries(&entries);
+
+    // real flash content below the mask, 0xCC above it
+    let real = |lba: u64| -> Vec<u8> { (0..512).map(|i| (lba as usize * 7 + i) as u8).collect() };
+    let cc = vec![0xccu8; 512];
+    let low_reply = [real(512), real(513), real(514)].concat();
+    let straddle_reply = [real(GUARD - 2), real(GUARD - 1), cc.clone(), cc.clone()].concat();
+    let high_reply = [cc.clone(), cc.clone()].concat();
+
+    let mut steps = Vec::new();
+    let mut tag = 0x5a5a0000u32;
+    macro_rules! t {
+        () => {{
+            tag += 1;
+            tag
+        }};
+    }
+
+    // GPT: 34 sectors from LBA1
+    steps.push(Step::BulkOut(cbw(
+        t!(),
+        34 * 512,
+        true,
+        10,
+        opcode::READ_LBA,
+        0,
+        1,
+        34,
+    )));
+    steps.push(Step::BulkIn(gpt_raw.clone()));
+    steps.push(Step::BulkIn(csw(tag)));
+
+    // flash_detect (for the report)
+    steps.push(Step::BulkOut(cbw(
+        t!(),
+        11,
+        true,
+        6,
+        opcode::READ_FLASH_INFO,
+        0,
+        0,
+        0,
+    )));
+    steps.push(Step::BulkIn(flash_info_reply(READ_LIMIT)));
+    steps.push(Step::BulkIn(csw(tag)));
+    steps.push(Step::BulkOut(cbw(
+        t!(),
+        5,
+        true,
+        6,
+        opcode::READ_FLASH_ID,
+        0,
+        0,
+        0,
+    )));
+    steps.push(Step::BulkIn(vec![0x2c, 0x64, 0x90, 0xa5, 0x76]));
+    steps.push(Step::BulkIn(csw(tag)));
+
+    // low (3 sectors)
+    steps.push(Step::BulkOut(cbw(
+        t!(),
+        3 * 512,
+        true,
+        10,
+        opcode::READ_LBA,
+        0,
+        512,
+        3,
+    )));
+    steps.push(Step::BulkIn(low_reply.clone()));
+    steps.push(Step::BulkIn(csw(tag)));
+    // straddle (4 sectors: 2 real + 0xCC tail — the unmeasured crossing
+    // READ_LBA assumption)
+    steps.push(Step::BulkOut(cbw(
+        t!(),
+        4 * 512,
+        true,
+        10,
+        opcode::READ_LBA,
+        0,
+        (GUARD - 2) as u32,
+        4,
+    )));
+    steps.push(Step::BulkIn(straddle_reply.clone()));
+    steps.push(Step::BulkIn(csw(tag)));
+    // high (2 sectors of 0xCC)
+    steps.push(Step::BulkOut(cbw(
+        t!(),
+        2 * 512,
+        true,
+        10,
+        opcode::READ_LBA,
+        0,
+        (GUARD + 16) as u32,
+        2,
+    )));
+    steps.push(Step::BulkIn(high_reply.clone()));
+    steps.push(Step::BulkIn(csw(tag)));
+
+    let transport = MockTransport::new(steps);
+    let mut s = LoaderSession::new(transport, EP_IN, EP_OUT);
+
+    let events = std::cell::RefCell::new(Vec::new());
+    let progress = |ev: Progress| events.borrow_mut().push(ev);
+    let out = std::env::temp_dir().join(format!("jb-stock-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let report = backup(&mut s, &test_config(), &out, &progress, true).expect("stock backup");
+    assert_eq!(report.partitions, 3);
+    assert_eq!(report.read_limit_old, None);
+
+    // every partition is dumped full-size with what the device returned
+    assert_eq!(std::fs::read(out.join("01_low.img")).unwrap(), low_reply);
+    assert_eq!(std::fs::read(out.join("02_straddle.img")).unwrap(), straddle_reply);
+    assert_eq!(std::fs::read(out.join("03_high.img")).unwrap(), high_reply);
+    assert_eq!(
+        std::fs::read_to_string(out.join("SHA256SUMS.txt"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+    assert!(std::fs::read_to_string(out.join("SUCCESS.txt"))
+        .unwrap()
+        .starts_with("SUCCESS: "));
+    jb_core::backup_store::BackupStore::open(&out)
+        .unwrap()
+        .verify()
+        .expect("verify");
+
+    // straddle and high are flagged, low is not; the run ends with the
+    // NOT-intact warning naming both
+    let evs = events.into_inner();
+    let step_msgs: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            Progress::Step(m) => Some(m.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        step_msgs
+            .iter()
+            .filter(|m| m.contains("выше маски чтения"))
+            .count(),
+        2
+    );
+    assert!(step_msgs
+        .iter()
+        .any(|m| m.contains("НЕцелостный") && m.contains("straddle") && m.contains("high")));
+
+    let _ = std::fs::remove_dir_all(&out);
 }
