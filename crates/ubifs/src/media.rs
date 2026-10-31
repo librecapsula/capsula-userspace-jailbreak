@@ -107,7 +107,7 @@ pub const UBIFS_DATA_NODE_SZ: usize = 48;
 /// `sizeof(struct ubifs_dent_node)`.
 pub const UBIFS_DENT_NODE_SZ: usize = 56;
 /// `sizeof(struct ubifs_trun_node)`.
-pub const UBIFS_TRUN_NODE_SZ: usize = 48;
+pub const UBIFS_TRUN_NODE_SZ: usize = 56;
 /// `sizeof(struct ubifs_pad_node)`.
 pub const UBIFS_PAD_NODE_SZ: usize = 28;
 /// `sizeof(struct ubifs_sb_node)`.
@@ -949,7 +949,7 @@ mod tests {
         assert_eq!(UBIFS_INO_NODE_SZ, 160);
         assert_eq!(UBIFS_DATA_NODE_SZ, 48);
         assert_eq!(UBIFS_DENT_NODE_SZ, 56);
-        assert_eq!(UBIFS_TRUN_NODE_SZ, 48);
+        assert_eq!(UBIFS_TRUN_NODE_SZ, 56);
         assert_eq!(UBIFS_PAD_NODE_SZ, 28);
         assert_eq!(UBIFS_SB_NODE_SZ, 4096);
         assert_eq!(UBIFS_MST_NODE_SZ, 512);

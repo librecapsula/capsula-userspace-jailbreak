@@ -45,6 +45,7 @@ pub mod crc;
 pub mod devtable;
 pub mod error;
 pub mod geometry;
+pub mod journal;
 pub mod key;
 pub mod lpt;
 pub mod media;
@@ -314,5 +315,169 @@ mod tests {
         let link = fs.lookup("/sub/hard-link").unwrap().unwrap();
         assert_eq!(link, inum);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Simulate an uncommitted journal on top of a freshly built image:
+    /// a bud with a new file, a deletion dent and a truncation,
+    /// referenced from the log. The reader must present the post-crash
+    /// state.
+    #[test]
+    fn journal_replay_overlays_newer_state() {
+        use crate::journal::JournalNode;
+
+        let big: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        let root = Inode::dir(
+            0o755,
+            vec![
+                ("big".into(), Inode::file(0o644, big.clone())),
+                ("gone".into(), Inode::file(0o644, b"bye".to_vec())),
+                ("shrink".into(), Inode::file(0o644, vec![9u8; 8192])),
+            ],
+        );
+        let mut opts = mkfs::Options::new(2048, 126976, 128);
+        opts.default_compr = Compr::None;
+        let image = mkfs::mkfs(&root, &opts).unwrap();
+        let leb_cnt = image.geometry.leb_cnt as usize;
+        let mut lebs: Vec<Option<Vec<u8>>> = image.lebs.clone();
+
+        // The uncommitted period: sqnums far above the committed ones.
+        let mut sq = 100_000u64;
+        let mut sqn = || {
+            sq += 1;
+            sq
+        };
+        let new_inum = 100u32;
+
+        let mut bud: Vec<u8> = Vec::new();
+        fn put(bud: &mut Vec<u8>, node: Vec<u8>, sqnum: u64) {
+            let mut n = node;
+            let node_type = n[20];
+            let len = n.len();
+            crate::media::finish_node(&mut n, node_type, sqnum);
+            bud.extend_from_slice(&n);
+            let pad = len.div_ceil(8) * 8 - len;
+            bud.extend(std::iter::repeat_n(0xFF, pad));
+        }
+
+        // A new file "new.txt" under the root: dent + ino + data.
+        let dent_key = crate::key::Key::dent(1, b"new.txt").unwrap();
+        put(
+            &mut bud,
+            crate::media::DentNode {
+                key: dent_key,
+                inum: new_inum as u64,
+                itype: crate::media::UBIFS_ITYPE_REG,
+                cookie: 0,
+                name: b"new.txt".to_vec(),
+            }
+            .to_node(0),
+            sqn(),
+        );
+        put(
+            &mut bud,
+            crate::media::InoNode {
+                key: crate::key::Key::ino(new_inum),
+                creat_sqnum: sqn(),
+                size: 5,
+                atime_sec: 1,
+                ctime_sec: 1,
+                mtime_sec: 1,
+                atime_nsec: 0,
+                ctime_nsec: 0,
+                mtime_nsec: 0,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                mode: 0o100644,
+                flags: 0,
+                xattr_cnt: 0,
+                xattr_size: 0,
+                xattr_names: 0,
+                compr_type: 0,
+                data: vec![],
+            }
+            .to_node(0),
+            sqn(),
+        );
+        put(
+            &mut bud,
+            crate::media::DataNode {
+                key: crate::key::Key::data(new_inum, 0),
+                size: 5,
+                compr_type: 0,
+                compr_size: 0,
+                data: b"hello".to_vec(),
+            }
+            .to_node(0),
+            sqn(),
+        );
+
+        // A deletion dent for "gone" (inum == 0).
+        put(
+            &mut bud,
+            crate::media::DentNode {
+                key: crate::key::Key::dent(1, b"gone").unwrap(),
+                inum: 0,
+                itype: crate::media::UBIFS_ITYPE_REG,
+                cookie: 0,
+                name: b"gone".to_vec(),
+            }
+            .to_node(0),
+            sqn(),
+        );
+
+        // A truncation of "shrink" down to one block.
+        let shrink_inum = {
+            // Figure the inum out from the committed tree.
+            let fs = Ubifs::new(lebs[..leb_cnt].to_vec()).unwrap();
+            fs.lookup("/shrink").unwrap().unwrap()
+        };
+        let mut trun = vec![0u8; crate::media::UBIFS_TRUN_NODE_SZ];
+        trun[20] = crate::media::UBIFS_TRUN_NODE;
+        trun[24..28].copy_from_slice(&shrink_inum.to_le_bytes());
+        trun[40..48].copy_from_slice(&8192u64.to_le_bytes());
+        trun[48..56].copy_from_slice(&4096u64.to_le_bytes());
+        put(&mut bud, trun, sqn());
+
+        // Place the bud in the first LEB past the committed ones and
+        // reference it from the log (right after the CS node).
+        lebs[leb_cnt] = Some({
+            let mut l = vec![0xFF; 126976];
+            l[..bud.len()].copy_from_slice(&bud);
+            l
+        });
+        let mut refn = vec![0u8; crate::media::UBIFS_REF_NODE_SZ];
+        refn[24..28].copy_from_slice(&(leb_cnt as u32).to_le_bytes());
+        refn[28..32].copy_from_slice(&0u32.to_le_bytes());
+        refn[32..36].copy_from_slice(&0u32.to_le_bytes());
+        crate::media::finish_node(&mut refn, crate::media::UBIFS_REF_NODE, sqn());
+        if let Some(log) = lebs[3].as_mut() {
+            log[32..32 + crate::media::UBIFS_REF_NODE_SZ].copy_from_slice(&refn);
+        }
+
+        let fs = Ubifs::new(lebs[..leb_cnt + 1].to_vec()).unwrap();
+        fs.verify().unwrap();
+        assert!(fs.is_dirty());
+
+        // The new file is visible with its content.
+        let n = fs.lookup("/new.txt").unwrap().unwrap();
+        assert_eq!(fs.read_file(n, 5).unwrap(), b"hello");
+        // The deleted file is gone.
+        assert_eq!(fs.lookup("/gone").unwrap(), None);
+        // The truncated file shrank to one block.
+        let sh = fs.lookup("/shrink").unwrap().unwrap();
+        assert_eq!(fs.ino_node(sh).unwrap().unwrap().size, 4096);
+        assert_eq!(fs.read_file(sh, 4096).unwrap(), vec![9u8; 4096]);
+        // The untouched file is intact.
+        let b = fs.lookup("/big").unwrap().unwrap();
+        assert_eq!(fs.read_file(b, 8192).unwrap(), big);
+
+        // The journal is exposed for inspection.
+        let j = fs.journal.as_ref().unwrap();
+        assert_eq!(j.refs.len(), 1);
+        assert!(j
+            .entries
+            .iter()
+            .any(|e| matches!(e.node, JournalNode::Trun { .. })));
     }
 }
