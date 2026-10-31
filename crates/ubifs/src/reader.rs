@@ -240,6 +240,26 @@ impl Ubifs {
         })
     }
 
+    /// Read the raw bytes of a committed-index leaf (the whole node,
+    /// verified).
+    pub fn leaf_node(&self, leaf: LeafRef) -> Result<Vec<u8>> {
+        let leb = self
+            .lebs
+            .get(leaf.lnum as usize)
+            .and_then(|l| l.as_deref())
+            .ok_or_else(|| Error::MissingData(format!("leb {} is unmapped", leaf.lnum)))?;
+        let offs = leaf.offs as usize;
+        let len = leaf.len as usize;
+        if offs + len > leb.len() {
+            return Err(Error::BadNode(format!(
+                "leaf at {}:{} overruns leb",
+                leaf.lnum, leaf.offs
+            )));
+        }
+        let (node, _) = parse_node(&leb[offs..], len, "leaf node")?;
+        Ok(node.to_vec())
+    }
+
     /// The main-area lprops (after the totals cross-check).
     pub fn lprops(&self) -> &[Lprops] {
         &self.lprops

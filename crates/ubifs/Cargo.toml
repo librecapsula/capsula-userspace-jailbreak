@@ -31,5 +31,6 @@ xattr = { version = "1", optional = true }
 
 [dev-dependencies]
 rust-lzo1x = "0.4"
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 
 [workspace]

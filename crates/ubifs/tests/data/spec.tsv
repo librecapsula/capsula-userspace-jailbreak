@@ -1,0 +1,17 @@
+# path	kind	mode	uid	gid	size	sha256	target_or_rdev	xattrs
+/attrs	dir	755	0	0	0	-	-	
+/attrs/notes.txt	reg	644	0	0	2100	96658f9fb1cd803bbf682b325a4c0c303458fd0e6baffe87142b4562f55b3175	-	user.other=xyz;user.test=hello
+/meta	dir	755	0	0	0	-	-	
+/meta/hard1.bin	reg	755	0	0	200000	e24bc62381f1224fbbb74688663f8f9743b9680b193edd666835e97b06e730eb	-	
+/meta/hard2.bin	reg	755	0	0	200000	e24bc62381f1224fbbb74688663f8f9743b9680b193edd666835e97b06e730eb	-	
+/meta/link	lnk	777	0	0	0	-	/regular/small.txt	
+/meta/loopb	blk	600	0	0	0	-	7:0	
+/meta/nullc	chr	644	0	0	0	-	1:3	
+/meta/pipe	fifo	644	0	0	0	-	-	
+/meta/sock	sock	755	0	0	0	-	-	
+/regular	dir	755	0	0	0	-	-	
+/regular/big.bin	reg	755	0	0	200000	e24bc62381f1224fbbb74688663f8f9743b9680b193edd666835e97b06e730eb	-	
+/regular/empty.bin	reg	644	0	0	0	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	-	
+/regular/holes.bin	reg	644	0	0	12288	3bcf15c78b571feb35992844590ad6b87780f723a576d4e4180d301318de9378	-	
+/regular/random.bin	reg	644	0	0	8192	e6ea33fecb1161a84b6a80088fb934791319393ff244d3edd96b04642a36d41d	-	
+/regular/small.txt	reg	644	0	0	6	5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03	-	
