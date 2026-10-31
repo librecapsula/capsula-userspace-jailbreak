@@ -1,0 +1,9 @@
+[package]
+name = "ubifs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# WIP: не включён в workspace members — черновик парсера/строителя UBIFS
+# для записи раздела data Mini (см. HANDOFF в корне после завершения).
+[dependencies]
