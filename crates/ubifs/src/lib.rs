@@ -53,6 +53,7 @@ pub mod reader;
 pub mod tnc;
 pub mod tree;
 pub mod ubi;
+pub mod ubinize;
 pub mod walk;
 
 pub use compress::Compr;

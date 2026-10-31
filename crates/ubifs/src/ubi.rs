@@ -22,14 +22,31 @@ pub const UBI_EC_HDR_SIZE: usize = 64;
 pub const UBI_VID_HDR_SIZE: usize = 64;
 /// Volume table record size.
 pub const UBI_VTBL_RECORD_SIZE: usize = 172;
-/// The internal layout-volume id (`UBI_LAYOUT_VOLUME_ID`).
-pub const UBI_LAYOUT_VOLUME_ID: u32 = 0x7FFF_FFFF;
+/// The internal layout-volume id (`UBI_LAYOUT_VOLUME_ID` =
+/// `UBI_INTERNAL_VOL_START` = 0x7FFFFFFF − 0x1000).
+pub const UBI_LAYOUT_VOLUME_ID: u32 = 0x7FFF_EFFF;
 /// A dynamic volume (`UBI_VID_DYNAMIC`).
 pub const UBI_VID_DYNAMIC: u8 = 1;
 /// A static volume (`UBI_VID_STATIC`).
 pub const UBI_VID_STATIC: u8 = 2;
 /// The volume "autoresize" flag (`UBI_VTBL_AUTORESIZE_FLG`).
 pub const UBI_VTBL_AUTORESIZE_FLG: u8 = 0x01;
+/// The volume "skip static CRC check" flag
+/// (`UBI_VTBL_SKIP_CRC_CHECK_FLG`).
+pub const UBI_VTBL_SKIP_CRC_CHECK_FLG: u8 = 0x02;
+/// The maximum number of volumes per device (`UBI_MAX_VOLUMES`).
+pub const UBI_MAX_VOLUMES: u32 = 128;
+/// The maximum volume name length (`UBI_VOL_NAME_MAX`).
+pub const UBI_VOL_NAME_MAX: usize = 127;
+/// Compatibility: delete this internal volume (`UBI_COMPAT_DELETE`).
+pub const UBI_COMPAT_DELETE: u8 = 1;
+/// Compatibility: attach read-only (`UBI_COMPAT_RO`).
+pub const UBI_COMPAT_RO: u8 = 2;
+/// Compatibility: preserve (`UBI_COMPAT_PRESERVE`).
+pub const UBI_COMPAT_PRESERVE: u8 = 4;
+/// Compatibility: reject the image (`UBI_COMPAT_REJECT`) — the layout
+/// volume's marker.
+pub const UBI_COMPAT_REJECT: u8 = 5;
 
 /// A PEB EC header (`struct ubi_ec_hdr`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +104,9 @@ pub struct VidHeader {
     pub vol_type: u8,
     /// The LEB copy flag (garbage collection).
     pub copy_flag: u8,
+    /// The compatibility field (internal volumes only; the layout
+    /// volume carries `UBI_COMPAT_REJECT`).
+    pub compat: u8,
     /// Volume identifier.
     pub vol_id: u32,
     /// The LEB number inside the volume.
@@ -115,8 +135,9 @@ impl VidHeader {
             return Err(Error::BadCrc("VID header crc mismatch".into()));
         }
         Ok(VidHeader {
-            vol_type: b[6],
-            copy_flag: b[7],
+            vol_type: b[5],
+            copy_flag: b[6],
+            compat: b[7],
             vol_id: be32(b, 8),
             lnum: be32(b, 12),
             data_size: be32(b, 20),
@@ -131,8 +152,9 @@ impl VidHeader {
         let mut b = [0u8; UBI_VID_HDR_SIZE];
         b[0..4].copy_from_slice(&UBI_VID_HDR_MAGIC.to_be_bytes());
         b[4] = UBI_VERSION;
-        b[6] = self.vol_type;
-        b[7] = self.copy_flag;
+        b[5] = self.vol_type;
+        b[6] = self.copy_flag;
+        b[7] = self.compat;
         b[8..12].copy_from_slice(&self.vol_id.to_be_bytes());
         b[12..16].copy_from_slice(&self.lnum.to_be_bytes());
         b[20..24].copy_from_slice(&self.data_size.to_be_bytes());
@@ -167,7 +189,10 @@ pub struct VtblRecord {
 }
 
 impl VtblRecord {
-    /// An empty record (the volume slot is free).
+    /// An empty record (the volume slot is free). Serializing it via
+    /// [`VtblRecord::to_bytes`] yields the CRC-carrying empty record of
+    /// `ubigen_create_vtbl` (the CRC is always recomputed from the
+    /// fields).
     pub fn empty() -> VtblRecord {
         VtblRecord {
             reserved_pebs: 0,
@@ -295,9 +320,13 @@ impl<'a> Dump<'a> {
         if raw.len() < peb * 2 {
             return Err(Error::MissingData("dump is smaller than two PEBs".into()));
         }
+        // Only the first max_volumes records of the LEB are the table
+        // (the LEB tail is 0xFF padding).
+        let leb_size = peb - geom.data_offset as usize;
+        let max_volumes = ((leb_size / UBI_VTBL_RECORD_SIZE) as u32).min(UBI_MAX_VOLUMES) as usize;
         let mut vtbl = Vec::new();
-        // The layout volume: two PEBs with vol_id 0x7FFFFFFF, lnum 0/1;
-        // the vtbl records live in the data at data_offset.
+        // The layout volume: two PEBs with the layout volume id, lnum
+        // 0/1; the vtbl records live in the data at data_offset.
         for base in [0usize, peb] {
             let vid = &raw[base + geom.vid_hdr_offset as usize..];
             let Ok(vh) = VidHeader::parse(vid) else {
@@ -307,7 +336,7 @@ impl<'a> Dump<'a> {
                 continue;
             }
             let data = &raw[base + geom.data_offset as usize..base + peb];
-            let recs = data.len() / UBI_VTBL_RECORD_SIZE;
+            let recs = (data.len() / UBI_VTBL_RECORD_SIZE).min(max_volumes);
             for r in 0..recs {
                 let rec = VtblRecord::parse(&data[r * UBI_VTBL_RECORD_SIZE..])?;
                 if vtbl.len() <= r {
@@ -353,141 +382,100 @@ impl<'a> Dump<'a> {
     }
 }
 
-/// Parameters for building a UBI image.
+/// A summary of one volume of a dump (the `ubinfo -a` view).
 #[derive(Debug, Clone)]
-pub struct BuildOptions {
-    /// The image/dump geometry.
-    pub geom: UbiGeometry,
-    /// The image sequence number (EC headers).
-    pub image_seq: u32,
-    /// The initial erase counter.
-    pub start_ec: u64,
+pub struct VolInfo {
+    /// The volume id.
+    pub vol_id: u32,
+    /// The volume name.
+    pub name: String,
+    /// The volume type (`UBI_VID_DYNAMIC`/`UBI_VID_STATIC`).
+    pub vol_type: u8,
+    /// How many PEBs are reserved for the volume.
+    pub reserved_pebs: u32,
+    /// The volume alignment.
+    pub alignment: u32,
+    /// The data padding of the alignment.
+    pub data_pad: u32,
+    /// `UBI_VTBL_*` flags.
+    pub flags: u8,
 }
 
-/// Build a UBI image: volumes + the volume table (the layout volume) —
-/// a minimal ubinize equivalent for dynamic volumes.
-///
-/// `volumes` is a list of (vol_id, name, volume LEBs); ids must be
-/// < 0x7FFFFFFF.
-pub fn build_image(volumes: &[Volume], opts: &BuildOptions) -> Result<Vec<u8>> {
-    let peb = opts.geom.peb_size as usize;
-    let data_len = peb - opts.geom.data_offset as usize;
-    let mut out: Vec<u8> = Vec::new();
-    let mut ec = opts.start_ec;
-
-    // The volume table: records padded up to data_len.
-    let n_volumes = volumes.len().max(1);
-    let vtbl_bytes = {
-        let mut v = vec![0u8; UBI_VTBL_RECORD_SIZE * n_volumes.next_power_of_two().max(2)];
-        for (i, vol) in volumes.iter().enumerate() {
-            let rec = VtblRecord {
-                reserved_pebs: vol.lebs.len() as u32,
-                alignment: 1,
-                data_pad: 0,
-                vol_type: UBI_VID_DYNAMIC,
-                upd_marker: 0,
-                name_len: vol.name.len() as u16,
-                name: {
-                    let mut n = [0u8; 128];
-                    let bytes = vol.name.as_bytes();
-                    if bytes.len() > 127 {
-                        return Err(Error::Overflow("volume name is too long".into()));
-                    }
-                    n[..bytes.len()].copy_from_slice(bytes);
-                    n
-                },
-                flags: UBI_VTBL_AUTORESIZE_FLG,
-            };
-            v[i * UBI_VTBL_RECORD_SIZE..(i + 1) * UBI_VTBL_RECORD_SIZE]
-                .copy_from_slice(&rec.to_bytes());
-        }
-        v.resize(data_len, 0);
-        v
-    };
-
-    // The two layout-volume PEBs.
-    for lnum in 0..2u32 {
-        let vh = VidHeader {
-            vol_type: UBI_VID_DYNAMIC,
-            copy_flag: 0,
-            vol_id: UBI_LAYOUT_VOLUME_ID,
-            lnum,
-            data_size: 0,
-            used_ebs: 0,
-            data_pad: 0,
-            data_crc: 0,
-        };
-        write_peb(&mut out, &opts.geom, &vh, Some(&vtbl_bytes), ec);
-        ec += 1;
+impl<'a> Dump<'a> {
+    /// The volume summary from the volume table (an `ubinfo` view).
+    pub fn info(&self) -> Vec<VolInfo> {
+        self.vtbl
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.reserved_pebs != 0)
+            .map(|(i, r)| VolInfo {
+                vol_id: i as u32,
+                name: r.name_str(),
+                vol_type: r.vol_type,
+                reserved_pebs: r.reserved_pebs,
+                alignment: r.alignment,
+                data_pad: r.data_pad,
+                flags: r.flags,
+            })
+            .collect()
     }
 
-    // The volumes.
-    for vol in volumes {
-        if vol.vol_id == UBI_LAYOUT_VOLUME_ID {
-            return Err(Error::Other("reserved layout volume id".into()));
-        }
-        if vol.lebs.len() > u32::MAX as usize {
-            return Err(Error::Overflow("volume is too large".into()));
-        }
-        for (lnum, leb) in vol.lebs.iter().enumerate() {
-            let vh = VidHeader {
-                vol_type: UBI_VID_DYNAMIC,
-                copy_flag: 0,
-                vol_id: vol.vol_id,
-                lnum: lnum as u32,
-                data_size: 0,
-                used_ebs: 0,
-                data_pad: 0,
-                data_crc: 0,
-            };
-            match leb {
-                Some(data) => {
-                    if data.len() != data_len {
-                        return Err(Error::Other(format!(
-                            "LEB size {} != data size {data_len}",
-                            data.len()
-                        )));
+    /// The VID headers of a volume's LEBs (unmapped — None), in LEB
+    /// order. Static volumes carry `data_size`/`used_ebs`/`data_crc`
+    /// here.
+    pub fn volume_vids(&self, vol_id: u32) -> Vec<Option<VidHeader>> {
+        let mut out: Vec<Option<VidHeader>> = Vec::new();
+        let peb = self.geom.peb_size as usize;
+        let mut base = 0usize;
+        while base + peb <= self.raw.len() {
+            let vid = &self.raw[base + self.geom.vid_hdr_offset as usize..];
+            if let Ok(vh) = VidHeader::parse(vid) {
+                if vh.vol_id == vol_id {
+                    if out.len() <= vh.lnum as usize {
+                        out.resize(vh.lnum as usize + 1, None);
                     }
-                    write_peb(&mut out, &opts.geom, &vh, Some(data), ec);
-                }
-                None => {
-                    // An unmapped LEB: the EC header is present, the VID
-                    // stays all-FF.
-                    write_peb(&mut out, &opts.geom, &vh, None, ec);
+                    out[vh.lnum as usize] = Some(vh);
                 }
             }
-            ec += 1;
+            base += peb;
         }
+        out
     }
-    Ok(out)
-}
 
-fn write_peb(out: &mut Vec<u8>, geom: &UbiGeometry, vh: &VidHeader, data: Option<&[u8]>, ec: u64) {
-    out.resize(out.len() + geom.peb_size as usize, 0xFF);
-    let start = out.len() - geom.peb_size as usize;
-    let ec_hdr = EcHeader {
-        ec,
-        vid_hdr_offset: geom.vid_hdr_offset,
-        data_offset: geom.data_offset,
-        image_seq: 0,
-    };
-    out[start..start + UBI_EC_HDR_SIZE].copy_from_slice(&ec_hdr.to_bytes());
-    if let Some(data) = data {
-        let voff = start + geom.vid_hdr_offset as usize;
-        out[voff..voff + UBI_VID_HDR_SIZE].copy_from_slice(&vh.to_bytes());
-        let doff = start + geom.data_offset as usize;
-        out[doff..doff + data.len()].copy_from_slice(data);
+    /// Verify a static volume: recompute the per-LEB `data_crc` of the
+    /// payload and compare with the VID headers.
+    pub fn verify_static(&self, vol_id: u32) -> Result<()> {
+        let vids = self.volume_vids(vol_id);
+        let lebs = self.volume_lebs(vol_id);
+        for (lnum, (vid, leb)) in vids.iter().zip(lebs.iter()).enumerate() {
+            let Some(vid) = vid else { continue };
+            let Some(leb) = leb else {
+                return Err(Error::MissingData(format!(
+                    "static volume {vol_id}: leb {lnum} is unmapped"
+                )));
+            };
+            let data = &leb[..vid.data_size as usize];
+            if crate::crc::crc32(data) != vid.data_crc {
+                return Err(Error::BadCrc(format!(
+                    "static volume {vol_id}: leb {lnum} data crc mismatch"
+                )));
+            }
+        }
+        Ok(())
     }
-}
 
-/// A volume for image building.
-pub struct Volume {
-    /// The volume identifier.
-    pub vol_id: u32,
-    /// The volume name (for the volume table).
-    pub name: String,
-    /// The volume LEBs; None — unmapped.
-    pub lebs: Vec<Option<Vec<u8>>>,
+    /// The image sequence number from the first valid EC header.
+    pub fn image_seq(&self) -> Option<u32> {
+        let peb = self.geom.peb_size as usize;
+        let mut base = 0usize;
+        while base + peb <= self.raw.len() {
+            if let Ok(ec) = EcHeader::parse(&self.raw[base..]) {
+                return Some(ec.image_seq);
+            }
+            base += peb;
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -508,6 +496,7 @@ mod tests {
         let vh = VidHeader {
             vol_type: UBI_VID_DYNAMIC,
             copy_flag: 0,
+            compat: 0,
             vol_id: 0,
             lnum: 5,
             data_size: 0,
@@ -520,29 +509,51 @@ mod tests {
     }
 
     #[test]
-    fn build_then_parse() {
-        let geom = UbiGeometry::from_peb_size(0x20000, 2048);
-        let vol = Volume {
-            vol_id: 0,
-            name: "data".into(),
-            lebs: vec![Some(vec![0xAB; (geom.peb_size - geom.data_offset) as usize]); 3],
-        };
-        let img = build_image(
-            &[vol],
-            &BuildOptions {
-                geom,
-                image_seq: 0,
-                start_ec: 0,
+    fn ubinize_build_then_parse() {
+        use crate::ubinize;
+        let opts = ubinize::Options::new(0x20000, 2048);
+        let (geom, leb) = opts.geometry().unwrap();
+        assert_eq!(geom.vid_hdr_offset, 2048);
+        assert_eq!(geom.data_offset, 4096);
+        assert_eq!(leb, 0x20000 - 4096);
+
+        let vols = vec![
+            ubinize::Volume {
+                vol_type: ubinize::VolType::Dynamic,
+                vol_id: 0,
+                vol_name: "data".into(),
+                vol_alignment: 1,
+                vol_flags: None,
+                image: Some(vec![0xAB; leb as usize * 3]),
+                bytes: leb as u64 * 3,
             },
-        )
-        .unwrap();
+            ubinize::Volume {
+                vol_type: ubinize::VolType::Static,
+                vol_id: 1,
+                vol_name: "firmware".into(),
+                vol_alignment: 1,
+                vol_flags: Some(ubinize::VolFlags::SkipCheck),
+                image: Some(vec![0xCD; 1000]),
+                bytes: 1000,
+            },
+        ];
+        let img = ubinize::build_image(&opts, &vols).unwrap();
         let dump = Dump::parse(&img, geom).unwrap();
-        assert_eq!(
-            dump.volumes(),
-            vec![(0, "data".to_string(), UBI_VID_DYNAMIC)]
-        );
+        let info = dump.info();
+        assert_eq!(info.len(), 2);
+        assert_eq!(info[0].name, "data");
+        assert_eq!(info[1].name, "firmware");
+        assert_eq!(info[1].vol_type, UBI_VID_STATIC);
+
         let lebs = dump.volume_lebs(0);
         assert_eq!(lebs.len(), 3);
         assert!(lebs.iter().all(|l| l.as_ref().unwrap()[0] == 0xAB));
+        dump.verify_static(1).unwrap();
+        assert_eq!(dump.image_seq(), Some(0));
+
+        // The layout volume sits at PEBs 0-1 with compat = REJECT.
+        let vids = dump.volume_vids(UBI_LAYOUT_VOLUME_ID);
+        assert_eq!(vids.len(), 2);
+        assert_eq!(vids[0].unwrap().compat, UBI_COMPAT_REJECT);
     }
 }
