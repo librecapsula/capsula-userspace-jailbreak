@@ -1,0 +1,75 @@
+name: ubifs crate
+
+# The ubifs crate is a standalone workspace (crates/ubifs) with its own
+# committed official-tools corpus, so its tests run fully offline.
+on:
+  push:
+    branches: [main]
+    paths: ["crates/ubifs/**", ".github/workflows/ubifs-ci.yml"]
+  pull_request:
+    paths: ["crates/ubifs/**", ".github/workflows/ubifs-ci.yml"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/ubifs
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["--all-features", "", "--no-default-features", "--features zlib", "--features lzo"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/ubifs
+      - name: Test
+        run: cargo test ${{ matrix.features }}
+
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/ubifs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/ubifs
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo doc --no-deps --document-private-items
+
+  # Byte parity against the real mtd-utils: regenerate parts of the
+  # committed corpus and re-run the docker harnesses. Manual only —
+  # it needs docker and builds mtd-utils from git (~3 min).
+  parity:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/ubifs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: mkfs.ubifs byte parity
+        run: bash tests/mkfs-parity.sh
+      - name: ubinize byte parity
+        run: bash tests/ubinize-parity.sh
+      - name: Corpus reproducibility
+        run: |
+          cp -r tests/data /tmp/data-before
+          bash tests/data/gen.sh >/dev/null
+          for f in /tmp/data-before/*.zlib /tmp/data-before/spec.tsv; do
+            cmp "$f" "tests/data/$(basename "$f")"
+          done
