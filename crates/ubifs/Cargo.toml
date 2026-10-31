@@ -3,7 +3,23 @@ name = "ubifs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Pure-Rust UBIFS/UBI image reader, builder and modifier (mkfs.ubifs-compatible)"
+repository = "https://github.com/librecapsula/ubifs"
+keywords = ["ubifs", "ubi", "mtd", "filesystem", "embedded"]
+categories = ["filesystem", "parser-implementations", "embedded"]
 
-# WIP: не включён в workspace members — черновик парсера/строителя UBIFS
-# для записи раздела data Mini (см. HANDOFF в корне после завершения).
+[features]
+default = ["zlib", "lzo"]
+# ZLIB (UBIFS_COMPR_ZLIB) data decompression when reading images.
+zlib = ["dep:miniz_oxide"]
+# LZO1X (UBIFS_COMPR_LZO) data decompression when reading images.
+lzo = ["dep:lzo"]
+
 [dependencies]
+miniz_oxide = { version = "0.8", optional = true, default-features = false, features = ["with-alloc"] }
+lzo = { version = "0.1", optional = true, default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+rust-lzo1x = "0.4"
+
+[workspace]
