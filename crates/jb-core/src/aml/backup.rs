@@ -26,7 +26,7 @@
 use crate::backup_store::{file_sha256, safe_capture_name, CaptureDirectory};
 use crate::session::{Progress, ProgressFn};
 use amlogic::{fdt, nand, AmlogicSession, Transport};
-use anyhow::{ensure, Context};
+use anyhow::{bail, ensure, Context};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -327,11 +327,27 @@ impl<T: Transport> Device for AmlogicSession<T> {
     }
 }
 
-/// Создать каталог захвата и стартовый манифест; каталог возвращается
-/// вызывающему и переоткрывается каждым [`capture_pass`].
-pub fn start(parent: &Path) -> anyhow::Result<PathBuf> {
-    let dir = CaptureDirectory::create(parent, "amlogic")?;
-    let m = Manifest {
+/// Идентичность колонки: `deviceid` из окружения u-boot (ключевое
+/// хранилище платы — device-уникален и стабилен), аналог серийника
+/// rockchip-колонок и ключ каталога бэкапа; в bootargs он же светится
+/// как `androidboot.deviceid`.
+pub fn device_id(env_raw: &[u8]) -> anyhow::Result<String> {
+    let text = environment_text(env_raw)?;
+    let raw = text
+        .lines()
+        .find_map(|l| l.strip_prefix("deviceid="))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .context("в окружении нет deviceid — колонку не опознать")?;
+    ensure!(
+        (8..=32).contains(&raw.len()) && raw.chars().all(|c| c.is_ascii_hexdigit()),
+        "некорректный deviceid {raw:?}"
+    );
+    Ok(raw.to_ascii_uppercase())
+}
+
+fn fresh_manifest() -> Manifest {
+    Manifest {
         schema: 2,
         profile: "capsula-mini-a113x".into(),
         nand_size: nand::NAND_SIZE,
@@ -343,9 +359,92 @@ pub fn start(parent: &Path) -> anyhow::Result<PathBuf> {
         status: Status::Running,
         files: vec![],
         error: None,
-    };
-    save_manifest(&dir, &m)?;
-    Ok(dir.path().into())
+    }
+}
+
+/// Результат открытия каталога захвата.
+pub enum OpenedCapture {
+    /// Захват не завершён — гоняй [`capture_pass`] по этому каталогу
+    /// (новый или продолжаемый с чекпоинта прошлых запусков).
+    Run(PathBuf),
+    /// Полный проверенный захват уже лежит в каталоге — снимать нечего.
+    Done(BackupReport),
+}
+
+/// Открыть (или создать) каталог бэкапа по серийнику — как у rockchip:
+/// `backup/<deviceid>/`. Окружение читается с устройства ровно один раз
+/// за запуск (вызывающий передаёт его сюда) и сразу записывается в
+/// каталог, так что `drive()` этот шаг пропускает. Поведение при
+/// существующем каталоге:
+/// - полный и верифицированный захват — [`OpenedCapture::Done`];
+/// - незавершённый (`Running`) — продолжается с чекпоинта; окружение в
+///   каталоге сверяется с deviceid свежепрочитанного (чужой каталог —
+///   отказ, продолжать чужой захват нельзя);
+/// - `Failed` или нечитаемый манифест — отказ, разбираться вручную.
+pub fn open_or_start(parent: &Path, env_raw: &[u8]) -> anyhow::Result<OpenedCapture> {
+    let id = device_id(env_raw)?;
+    let dir_path = parent.join(&id);
+    if !dir_path.exists() {
+        let dir = CaptureDirectory::create_with_name(parent, &id)?;
+        let mut m = fresh_manifest();
+        let text = environment_text(env_raw)?.to_string();
+        bytes(&dir, &mut m, "env-export.bin", env_raw)?;
+        bytes(&dir, &mut m, "env.txt", text.as_bytes())?;
+        save_manifest(&dir, &m)?;
+        return Ok(OpenedCapture::Run(dir.path().into()));
+    }
+    // каталог уже есть — разобрать его состояние
+    let mp = dir_path.join("manifest.json");
+    ensure!(
+        mp.is_file(),
+        "каталог {} есть, но манифеста в нём нет — разберитесь вручную",
+        dir_path.display()
+    );
+    let m: Manifest = serde_json::from_slice(&std::fs::read(&mp)?)
+        .with_context(|| format!("манифест в {} не читается", dir_path.display()))?;
+    ensure!(
+        m.schema == 2 && m.profile == "capsula-mini-a113x",
+        "каталог {} чужой схемы ({} schema {}) — разберитесь вручную",
+        dir_path.display(),
+        m.profile,
+        m.schema
+    );
+    match m.status {
+        Status::Complete | Status::Warnings => Ok(OpenedCapture::Done(verify(&dir_path)?)),
+        Status::Failed => bail!(
+            "прошлый захват в {} завершился ошибкой ({}) — разберитесь и \
+             удалите каталог, чтобы начать заново",
+            dir_path.display(),
+            m.error.as_deref().unwrap_or("без описания")
+        ),
+        Status::Running => {
+            // чужой каталог не продолжаем: сверяем deviceid сохранённого
+            // окружения с прочитанным только что
+            match std::fs::read(dir_path.join("env-export.bin")) {
+                Ok(raw) => {
+                    let recorded = device_id(&raw)?;
+                    ensure!(
+                        recorded == id,
+                        "каталог {} принадлежит колонке {}, а на шине {id} — \
+                         продолжать чужой захват нельзя",
+                        dir_path.display(),
+                        recorded
+                    );
+                }
+                // старый незавершённый захват без окружения — дописываем
+                // свежее (deviceid уже совпал по имени каталога)
+                Err(_) => {
+                    let dir = CaptureDirectory::open(&dir_path)?;
+                    let mut m = m;
+                    let text = environment_text(env_raw)?.to_string();
+                    bytes(&dir, &mut m, "env-export.bin", env_raw)?;
+                    bytes(&dir, &mut m, "env.txt", text.as_bytes())?;
+                    save_manifest(&dir, &m)?;
+                }
+            }
+            Ok(OpenedCapture::Run(dir_path))
+        }
+    }
 }
 
 /// Один проход окна: продолжить захват из чекпоинта в `dir_path`.
@@ -685,6 +784,7 @@ fn drive(
         let layout = dev.layout(&blob).map_err(DriveError::fatal)?;
         bytes(dir, m, "device.dtb", &blob).map_err(DriveError::Fatal)?;
         m.layout = layout.to_records();
+        m.nand_size = layout.nand_size;
         m.reserved = layout
             .reserved
             .iter()
@@ -1515,5 +1615,126 @@ mod tests {
             b[struct_off + self.st.len()..].copy_from_slice(&self.strings);
             b
         }
+    }
+
+    // --- identity: бэкап по серийнику (deviceid) ---
+
+    fn env_bytes(text: &str) -> Vec<u8> {
+        let mut data = vec![0u8; amlogic::ENV_SIZE];
+        data[..text.len()].copy_from_slice(text.as_bytes());
+        data
+    }
+
+    fn test_env(id: &str) -> Vec<u8> {
+        env_bytes(&format!("bootcmd=run storeboot\ndeviceid={id}\n"))
+    }
+
+    #[test]
+    fn device_id_parses_and_validates() {
+        assert_eq!(
+            device_id(&test_env("0394A722CE668914")).unwrap(),
+            "0394A722CE668914"
+        );
+        assert_eq!(
+            device_id(&test_env("deadbeef01234567")).unwrap(),
+            "DEADBEEF01234567"
+        );
+        assert!(device_id(&env_bytes("bootcmd=x\n")).is_err(), "нет deviceid");
+        assert!(device_id(&test_env("short")).is_err(), "слишком короткий");
+        assert!(device_id(&test_env("0394A722CE66891!")).is_err(), "не hex");
+        assert!(
+            device_id(&test_env(&"A".repeat(33))).is_err(),
+            "слишком длинный"
+        );
+        assert!(
+            device_id(&env_bytes("garbage without nul")).is_err(),
+            "некорректное окружение"
+        );
+    }
+
+    #[test]
+    fn open_or_start_pre_records_env_and_drive_skips_it() {
+        let parent = parent();
+        let dir = match open_or_start(parent.path(), &test_env("0394A722CE668914")).unwrap() {
+            OpenedCapture::Run(p) => p,
+            OpenedCapture::Done(_) => panic!("новый каталог не Done"),
+        };
+        assert_eq!(dir.file_name().unwrap(), "0394A722CE668914");
+        assert!(dir.join("env.txt").is_file());
+        assert!(dir.join("env-export.bin").is_file());
+        // окружение уже записано — drive его не снимает
+        let mut dev = Fake::new();
+        match run_pass(&mut dev, &dir).unwrap() {
+            Pass::Done(report) => {
+                assert_eq!(report.status, Status::Complete);
+                assert!(!dev.calls.borrow().contains(&"env".to_string()));
+            }
+            Pass::Interrupted(r) => panic!("не прошло: {r}"),
+        }
+        // повторное открытие завершённого каталога — Done без захвата
+        let mut dev = Fake::new();
+        match open_or_start(parent.path(), &test_env("0394A722CE668914")).unwrap() {
+            OpenedCapture::Done(report) => {
+                assert_eq!(report.status, Status::Complete);
+                assert!(dev.calls.borrow().is_empty());
+            }
+            OpenedCapture::Run(_) => panic!("завершённый каталог не Done"),
+        }
+        std::fs::remove_dir_all(parent.path()).unwrap();
+    }
+
+    #[test]
+    fn open_or_start_resumes_an_interrupted_capture_across_runs() {
+        let parent = parent();
+        let dir = match open_or_start(parent.path(), &test_env("0394A722CE668914")).unwrap() {
+            OpenedCapture::Run(p) => p,
+            OpenedCapture::Done(_) => panic!("новый каталог не Done"),
+        };
+        let mut dev = Fake::new();
+        dev.chunk = 3;
+        assert!(matches!(run_pass(&mut dev, &dir).unwrap(), Pass::Interrupted(_)));
+        // «новый запуск»: тот же каталог продолжается с чекпоинта
+        let dir2 = match open_or_start(parent.path(), &test_env("0394A722CE668914")).unwrap() {
+            OpenedCapture::Run(p) => p,
+            OpenedCapture::Done(_) => panic!("незавершённый каталог не Run"),
+        };
+        assert_eq!(dir, dir2);
+        assert!(dir2.join("bootloader.bin.partial").is_file());
+        let mut dev = Fake::new();
+        match run_pass(&mut dev, &dir2).unwrap() {
+            Pass::Done(report) => assert_eq!(report.status, Status::Complete),
+            Pass::Interrupted(r) => panic!("резюм не дошёл до конца: {r}"),
+        }
+        std::fs::remove_dir_all(parent.path()).unwrap();
+    }
+
+    #[test]
+    fn open_or_start_refuses_tampered_and_failed_directories() {
+        let parent = parent();
+        let dir = match open_or_start(parent.path(), &test_env("0394A722CE668914")).unwrap() {
+            OpenedCapture::Run(p) => p,
+            OpenedCapture::Done(_) => panic!("новый каталог не Done"),
+        };
+        // в каталоге чужое окружение (переименовали/подменили)
+        std::fs::write(dir.join("env-export.bin"), test_env("FFFFFFFFFFFFFFFF").len().to_string().as_bytes()).ok();
+        std::fs::write(dir.join("env-export.bin"), {
+            let mut data = vec![0u8; amlogic::ENV_SIZE];
+            data[..1].copy_from_slice(b"x");
+            data
+        })
+            .unwrap();
+        // environment_text требует key=value — такое окружение не читается
+        let result = open_or_start(parent.path(), &test_env("0394A722CE668914"));
+        assert!(result.is_err(), "подменённое окружение должно отвергаться");
+
+        // Failed-манифест не продолжается
+        let mp = dir.join("manifest.json");
+        let mut m: Manifest =
+            serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
+        m.status = Status::Failed;
+        m.error = Some("test".into());
+        std::fs::write(&mp, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        assert!(open_or_start(parent.path(), &test_env("0394A722CE668914")).is_err());
+        std::fs::remove_dir_all(parent.path()).unwrap();
     }
 }

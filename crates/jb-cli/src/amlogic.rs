@@ -99,26 +99,60 @@ fn manual_reconnect(
     bring_up(None, progress)
 }
 
-/// Чекпоинт-цикл захвата: окна по очереди до полного дампа; каждое
-/// исчерпанное окно — просьба переподключить плату и ожидание её на
-/// шине.
+/// Чекпоинт-цикл захвата. Серийник (`deviceid` из окружения) читается
+/// с устройства ровно один раз за запуск и ключует каталог
+/// `backup/<deviceid>/` (паритет с rockchip): полный проверенный
+/// захват пропускается, незавершённый — продолжается с чекпоинта
+/// прошлых запусков. Каждая смерть сессии — просьба переподключить
+/// плату и ожидание её на шине.
 fn capture_all_windows(
-    session: amlogic::AmlogicSession<amlogic::NusbTransport>,
+    mut s: amlogic::AmlogicSession<amlogic::NusbTransport>,
     parent: &Path,
     progress: &dyn Fn(Progress),
 ) -> anyhow::Result<(
     aml::backup::BackupReport,
     amlogic::AmlogicSession<amlogic::NusbTransport>,
+    bool,
 )> {
-    let dir = aml::backup::start(parent).context("каталог захвата Amlogic")?;
-    let mut s = session;
+    // identity: окружение до каталога; смерть сессии на этом шаге —
+    // обычный перезаход, это по-прежнему только первое окно
+    let env_raw = {
+        let mut attempts = 0;
+        loop {
+            match aml::capture_env_raw(&mut s) {
+                Ok(env) => break env,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 3 {
+                        return Err(e).context("съём окружения (identity)");
+                    }
+                    log::warn!("съём окружения не удался ({e:#}) — перезаход в окно");
+                    s = reconnect_window(s, progress)?;
+                }
+            }
+        }
+    };
+    let dir = match aml::backup::open_or_start(parent, &env_raw)
+        .context("каталог захвата Amlogic")?
+    {
+        aml::backup::OpenedCapture::Done(report) => {
+            log::info!(
+                "бэкап уже есть в {} — дамп пропускаю (удалите каталог, \
+                 чтобы снять заново)",
+                report.path.display()
+            );
+            return Ok((report, s, true));
+        }
+        aml::backup::OpenedCapture::Run(path) => path,
+    };
+    let mut s = s;
     let mut last = captured_bytes(&dir);
     let mut stalls = 0u32;
     loop {
         match aml::backup::capture_pass(&mut s, &dir, progress)
             .context("проход захвата Amlogic")?
         {
-            Pass::Done(report) => return Ok((report, s)),
+            Pass::Done(report) => return Ok((report, s, false)),
             Pass::Interrupted(reason) => {
                 let now = captured_bytes(&dir);
                 stalls = if now > last { 0 } else { stalls + 1 };
@@ -191,9 +225,9 @@ impl Backend for Amlogic {
         let progress = |ev: Progress| p.handle(ev);
         let mut s = bring_up(wait, &progress)?;
 
-        // шаг 1: полный чекпоинт-захват по окнам (каждый запуск — свежий
-        // каталог; серийника, по которому кешировать бэкап, у amlogic-мин
-        // нет)
+        // шаг 1: полный чекпоинт-захват по окнам; каталог бэкапа
+        // ключуется по серийнику (deviceid из окружения) — проверенный
+        // захват пропускается, незавершённый продолжается
         let base = if no_backup {
             log::info!(
                 "--no-backup: бэкап не снимаю — data будет собран с нуля, \
@@ -201,7 +235,7 @@ impl Backend for Amlogic {
             );
             None
         } else {
-            let (report, session) =
+            let (report, session, _reused) =
                 capture_all_windows(s, Path::new("backup"), &progress)?;
             s = session;
             match report.status {
@@ -346,8 +380,12 @@ impl Backend for Amlogic {
         let p = CliProgress::new();
         let progress = |ev: Progress| p.handle(ev);
         let s = bring_up(wait, &progress)?;
-        let (report, _) = capture_all_windows(s, Path::new("backup"), &progress)
+        let (report, _, reused) = capture_all_windows(s, Path::new("backup"), &progress)
             .context("полный захват Amlogic")?;
+        if reused {
+            log::info!("nothing to do");
+            return Ok(());
+        }
         match report.status {
             aml::backup::Status::Complete => log::info!(
                 "готово: полный захват {} (на колонку не писалось)",

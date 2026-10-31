@@ -213,6 +213,7 @@ pub(crate) struct CaptureDirectory {
 }
 
 impl CaptureDirectory {
+    #[cfg(test)]
     pub(crate) fn create(parent: &Path, prefix: &str) -> std::io::Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -244,6 +245,22 @@ impl CaptureDirectory {
             std::io::ErrorKind::AlreadyExists,
             "cannot allocate capture directory",
         ))
+    }
+
+    /// Каталог с фиксированным именем (бэкап по серийнику устройства):
+    /// создаётся только если его ещё нет, права 0700.
+    pub(crate) fn create_with_name(parent: &Path, name: &str) -> std::io::Result<Self> {
+        safe_capture_name(name)?;
+        std::fs::create_dir_all(parent)?;
+        let path = parent.join(name);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path)?;
+        Ok(Self { path })
     }
 
     /// Переоткрыть каталог идущего захвата (чекпоинт-цикл по окнам:
