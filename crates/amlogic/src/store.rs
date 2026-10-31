@@ -142,14 +142,15 @@ mod tests {
         payload
     }
 
-    /// Vendor media head: attempt, length, add_sum at 0x08, chunk index
-    /// at 0x0c, algorithm 0xef + announced ack length at 0x10.
+    /// Vendor media head: attempt, length, chunk index at 0x08, add_sum
+    /// at 0x0c (the live gadget's order — confirmed on the wire),
+    /// algorithm 0xef + announced ack length at 0x10.
     fn media_head(attempt: u32, len: usize, seq: u32, sum: u32) -> Vec<u8> {
         let mut head = vec![0u8; 0x20];
         head[0..4].copy_from_slice(&attempt.to_le_bytes());
         head[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-        head[8..12].copy_from_slice(&sum.to_le_bytes());
-        head[12..16].copy_from_slice(&seq.to_le_bytes());
+        head[8..12].copy_from_slice(&seq.to_le_bytes());
+        head[12..16].copy_from_slice(&sum.to_le_bytes());
         head[16..18].copy_from_slice(&0x00efu16.to_le_bytes());
         head[18..20].copy_from_slice(&0x0100u16.to_le_bytes());
         head

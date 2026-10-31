@@ -9,7 +9,6 @@ use amlogic::store::NAND_WRITE_CHUNK;
 use amlogic::{nand, AmlogicSession, Transport};
 use anyhow::{anyhow, ensure};
 use std::io::{Read, Seek, SeekFrom};
-use std::time::{Duration, Instant};
 
 /// Снять сырой буфер текстового экспорта окружения u-boot. Ответы
 /// bulkcmd уходят в serial-консоль, поэтому окружение экспортируется в
@@ -66,14 +65,15 @@ impl WriteState {
     }
 }
 
-/// Один проход окна записи (flasher.sh `write_big_to_flash`, кусками):
-/// стереть остаток диапазона (если нужен) и записать сколько успеет
-/// кусков по [`NAND_WRITE_CHUNK`] — каждый кусок: `download mem` в ОЗУ
-/// (TPL-канал) + media-пакеты + `download get_status` + `nand write` по
-/// смещению. Возвращает `true`, когда образ записан целиком;
-/// `Ok(false)` — окно исчерпано: плату надо переподключить и вызвать
-/// снова (смерть сессии — нормальный конец окна, состояние в `st`);
-/// ошибки диска/источника — `Err`.
+/// Один проход записи (flasher.sh `write_big_to_flash`, кусками):
+/// стереть остаток диапазона (если нужен) и записывать кусками по
+/// [`NAND_WRITE_CHUNK`] — каждый кусок: identify-keepalive, `download
+/// mem` в ОЗУ (TPL-канал) + media-пакеты + `download get_status` +
+/// `nand write` по смещению. Проход длится до конца образа или до
+/// смерти сессии (искусственных бюджетов нет). Возвращает `true`,
+/// когда образ записан целиком; `Ok(false)` — сессия умерла: плату
+/// надо переподключить и вызвать снова (состояние в `st`); ошибки
+/// диска/источника — `Err`.
 pub fn write_data_pass<T: Transport>(
     s: &mut AmlogicSession<T>,
     image: &mut (impl Read + Seek),
@@ -81,12 +81,10 @@ pub fn write_data_pass<T: Transport>(
     total: usize,
     st: &mut WriteState,
     progress: &dyn Fn(usize),
-    budget: Duration,
 ) -> anyhow::Result<bool> {
     let page = nand::PAGE_SIZE as usize;
     ensure!(total > 0 && total.is_multiple_of(page), "размер образа некратен странице");
     ensure!(off.is_multiple_of(page as u32), "смещение записи некратно странице");
-    let start = Instant::now();
     if st.need_erase {
         // стирается только несделанный остаток: подтверждённые куски
         // не трогаются
@@ -100,7 +98,10 @@ pub fn write_data_pass<T: Transport>(
     }
     let mut buf = vec![0u8; NAND_WRITE_CHUNK];
     while st.written < total {
-        if start.elapsed() >= budget {
+        // keepalive: identify сбрасывает таймер простоя гаджета перед
+        // куском (после него nand write молчит на устройстве)
+        if let Err(e) = s.identify() {
+            log::warn!("amlogic: identify не дожился (окно?): {e}");
             return Ok(false);
         }
         let n = (total - st.written).min(NAND_WRITE_CHUNK);
@@ -153,8 +154,8 @@ mod tests {
         let mut head = vec![0u8; 0x20];
         head[0..4].copy_from_slice(&0u32.to_le_bytes());
         head[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-        head[8..12].copy_from_slice(&sum.to_le_bytes());
-        head[12..16].copy_from_slice(&seq.to_le_bytes());
+        head[8..12].copy_from_slice(&seq.to_le_bytes());
+        head[12..16].copy_from_slice(&sum.to_le_bytes());
         head[16..18].copy_from_slice(&0x00efu16.to_le_bytes());
         head[18..20].copy_from_slice(&0x0100u16.to_le_bytes());
         head
@@ -164,28 +165,21 @@ mod tests {
     /// 256 КиБ: один кусок NAND_WRITE_CHUNK.
     const TOTAL: usize = 0x4_0000;
 
-    /// Полный проход: erase + кусок (TPL arm + 4 media-пакета +
-    /// get_status + nand write).
-    #[test]
-    fn write_data_pass_completes_a_range() {
-        let image = vec![0x5au8; TOTAL];
+    fn identify_step() -> Step {
+        Step::ControlIn(req::IDENTIFY_HOST, 0, 0, vec![0, 7, 0, 16])
+    }
+
+    fn chunk_steps(image: &[u8], off: u32, total: usize) -> Vec<Step> {
         let mut steps = vec![
-            Step::ControlOut(
-                req::BULKCMD,
-                0,
-                2,
-                command(&format!("echo; nand erase {OFF:#x} {TOTAL:#x}")),
-            ),
-            Step::BulkIn(ok_512()),
             Step::ControlOut(
                 req::TPL_CMD,
                 0,
                 1,
-                command(&format!("download mem 0x1080000 normal {TOTAL:#x}")),
+                command(&format!("download mem 0x1080000 normal {total:#x}")),
             ),
             Step::ControlIn(req::TPL_STAT, 0, 0, ok_64()),
         ];
-        for seq in 0..(TOTAL / amlogic::MEDIA_CHUNK) {
+        for seq in 0..(total / amlogic::MEDIA_CHUNK) {
             let part = &image[seq * amlogic::MEDIA_CHUNK..(seq + 1) * amlogic::MEDIA_CHUNK];
             steps.push(Step::ControlOut(
                 req::WRITE_MEDIA,
@@ -207,33 +201,44 @@ mod tests {
             req::BULKCMD,
             0,
             2,
-            command(&format!("echo; nand write 0x1080000 {OFF:#x} {TOTAL:#x}")),
+            command(&format!("echo; nand write 0x1080000 {off:#x} {total:#x}")),
         ));
         steps.push(Step::BulkIn(ok_512()));
+        steps
+    }
+
+    /// Полный проход: erase + keepalive + кусок (TPL arm + 4 media-
+    /// пакета + get_status + nand write).
+    #[test]
+    fn write_data_pass_completes_a_range() {
+        let image = vec![0x5au8; TOTAL];
+        let mut steps = vec![
+            Step::ControlOut(
+                req::BULKCMD,
+                0,
+                2,
+                command(&format!("echo; nand erase {OFF:#x} {TOTAL:#x}")),
+            ),
+            Step::BulkIn(ok_512()),
+            identify_step(),
+        ];
+        steps.extend(chunk_steps(&image, OFF, TOTAL));
         let mut s = AmlogicSession::new(MockTransport::new(steps), 0x81, 0x02);
         let mut src = std::io::Cursor::new(image);
         let mut st = WriteState::fresh();
-        let done = write_data_pass(
-            &mut s,
-            &mut src,
-            OFF,
-            TOTAL,
-            &mut st,
-            &|_| {},
-            Duration::from_secs(60),
-        )
-        .unwrap();
+        let done = write_data_pass(&mut s, &mut src, OFF, TOTAL, &mut st, &|_| {}).unwrap();
         assert!(done);
         assert_eq!((st.written, st.need_erase), (TOTAL, false));
         assert_eq!(s.transport().pos, s.transport().steps.len());
     }
 
-    /// Нулевой бюджет: erase уходит, куски не начинаются; второй
-    /// проход с нормальным бюджетом НЕ повторяет erase (need_erase
-    /// уже снят) и дописывает диапазон.
+    /// Смерть после erase (до первого куска): need_erase остаётся
+    /// снятым — на следующем проходе erase не повторяется (писать было
+    /// нечего), а куски идут сразу.
     #[test]
-    fn write_data_pass_budget_end_then_resume() {
+    fn write_data_pass_resume_after_erase_does_not_repeat_erase() {
         let image = vec![0x11u8; TOTAL];
+        // проход 1: erase прошёл, дальше сессия мертва
         let steps = vec![
             Step::ControlOut(
                 req::BULKCMD,
@@ -246,60 +251,16 @@ mod tests {
         let mut s = AmlogicSession::new(MockTransport::new(steps), 0x81, 0x02);
         let mut src = std::io::Cursor::new(image.clone());
         let mut st = WriteState::fresh();
-        let done = write_data_pass(
-            &mut s, &mut src, OFF, TOTAL, &mut st, &|_| {}, Duration::ZERO,
-        )
-        .unwrap();
+        let done = write_data_pass(&mut s, &mut src, OFF, TOTAL, &mut st, &|_| {}).unwrap();
         assert!(!done);
         assert_eq!((st.written, st.need_erase), (0, false));
 
-        // возобновление: erase уже не шлётся
-        let mut steps = vec![
-            Step::ControlOut(
-                req::TPL_CMD,
-                0,
-                1,
-                command(&format!("download mem 0x1080000 normal {TOTAL:#x}")),
-            ),
-            Step::ControlIn(req::TPL_STAT, 0, 0, ok_64()),
-        ];
-        for seq in 0..(TOTAL / amlogic::MEDIA_CHUNK) {
-            let part = &image[seq * amlogic::MEDIA_CHUNK..(seq + 1) * amlogic::MEDIA_CHUNK];
-            steps.push(Step::ControlOut(
-                req::WRITE_MEDIA,
-                1,
-                0xffff,
-                media_head(amlogic::MEDIA_CHUNK, seq as u32, amlogic::add_sum(part)),
-            ));
-            steps.push(Step::BulkOut(part.to_vec()));
-            steps.push(Step::BulkIn(b"OK!!\0".to_vec()));
-        }
-        steps.push(Step::ControlOut(
-            req::BULKCMD,
-            0,
-            2,
-            command("download get_status"),
-        ));
-        steps.push(Step::BulkIn(ok_512()));
-        steps.push(Step::ControlOut(
-            req::BULKCMD,
-            0,
-            2,
-            command(&format!("echo; nand write 0x1080000 {OFF:#x} {TOTAL:#x}")),
-        ));
-        steps.push(Step::BulkIn(ok_512()));
+        // проход 2: erase не повторяется, сразу keepalive + кусок
+        let mut steps = vec![identify_step()];
+        steps.extend(chunk_steps(&image, OFF, TOTAL));
         let mut s = AmlogicSession::new(MockTransport::new(steps), 0x81, 0x02);
         let mut src = std::io::Cursor::new(image);
-        let done = write_data_pass(
-            &mut s,
-            &mut src,
-            OFF,
-            TOTAL,
-            &mut st,
-            &|_| {},
-            Duration::from_secs(60),
-        )
-        .unwrap();
+        let done = write_data_pass(&mut s, &mut src, OFF, TOTAL, &mut st, &|_| {}).unwrap();
         assert!(done);
         assert_eq!(st.written, TOTAL);
     }
@@ -310,20 +271,22 @@ mod tests {
     #[test]
     fn write_data_pass_marks_erase_after_a_mid_chunk_death() {
         let image = vec![0x22u8; TOTAL];
-        let steps = vec![Step::ControlOut(
-            req::BULKCMD,
-            0,
-            2,
-            command(&format!("echo; nand erase {OFF:#x} {TOTAL:#x}")),
-        )];
-        // сценарий обрывается сразу после erase — первый же кусок умрёт
+        let mut steps = vec![
+            Step::ControlOut(
+                req::BULKCMD,
+                0,
+                2,
+                command(&format!("echo; nand erase {OFF:#x} {TOTAL:#x}")),
+            ),
+            Step::BulkIn(ok_512()),
+            identify_step(),
+            // сценарий обрывается до TPL arm — первый же кусок умрёт
+        ];
+        let _ = &mut steps;
         let mut s = AmlogicSession::new(MockTransport::new(steps), 0x81, 0x02);
         let mut src = std::io::Cursor::new(image);
         let mut st = WriteState::fresh();
-        let done = write_data_pass(
-            &mut s, &mut src, OFF, TOTAL, &mut st, &|_| {}, Duration::from_secs(60),
-        )
-        .unwrap();
+        let done = write_data_pass(&mut s, &mut src, OFF, TOTAL, &mut st, &|_| {}).unwrap();
         assert!(!done);
         assert_eq!((st.written, st.need_erase), (0, true));
     }

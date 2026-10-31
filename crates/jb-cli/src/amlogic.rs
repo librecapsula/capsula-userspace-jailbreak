@@ -44,21 +44,12 @@ const RETRY_PAUSE: Duration = Duration::from_millis(10);
 const MAX_OPEN_FAILURES: u32 = 10;
 /// Сколько ждём ухода колонки с шины после команды reset.
 const REBOOT_WAIT: Duration = Duration::from_secs(30);
-/// Настенные часы одного окна: измеренная стена здоровой платы
-/// 250–350 мс от открытия сессии; берём с запасом вниз. Полевой
-/// эксперимент — AML_WINDOW_BUDGET_MS.
-const WINDOW_BUDGET: Duration = Duration::from_millis(250);
-/// Сколько окон подряд без прироста байт терпим, прежде чем признать
-/// устойчивую проблему (кабель/драйвер/плата) и выйти.
+/// Сколько сессий подряд без прироста байт терпим, прежде чем признать
+/// устойчивую проблему (кабель/драйвер/плата) и выйти. Сессия с
+/// identify-keepalive вывозит десятки МиБ (замер 2026-10-31: 160 МиБ),
+/// так что нулевой прирост — это именно кабель/драйвер, а не «мало
+/// успели».
 const MAX_STALLED_WINDOWS: u32 = 3;
-
-fn window_budget() -> Duration {
-    std::env::var("AML_WINDOW_BUDGET_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(WINDOW_BUDGET)
-}
 
 /// Байт захвата на диске (для детекции топтания на месте).
 fn captured_bytes(dir: &Path) -> u64 {
@@ -76,35 +67,15 @@ fn captured_bytes(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// После исчерпания окна — две попытки. Первая: рецепт стека
-/// `reenter_download_window` — вложенный `run try_auto_burn`
-/// (fire-and-forget) + 300 мс + port reset; если гаджет поднимается на
-/// тёплом цикле, новое окно ловится без передёргивания питания.
-/// Вторая (если рецепт не сработал — гаджет уже мёртв или тёплый цикл
-/// его не поднимает): просьба передёрнуть питание и ожидание платы
+/// Перезаход в окно: тёплый цикл гаджет не поднимает (проверено на
+/// живой плате: `run try_auto_burn` + port reset переэнумерации не
+/// дают) — просим передёрнуть питание и ждём плату на шине
 /// (flasher.sh `poll_for_device`).
 fn reconnect_window(
-    mut s: amlogic::AmlogicSession<amlogic::NusbTransport>,
+    _s: amlogic::AmlogicSession<amlogic::NusbTransport>,
     progress: &dyn Fn(Progress),
 ) -> anyhow::Result<amlogic::AmlogicSession<amlogic::NusbTransport>> {
-    // рецепт стека имеет смысл, только пока сессия жива: если окно
-    // умерло раньше нас (transfer cancelled), в мёртвый гаджет стрелять
-    // нечем и незачем
-    if amlogic::present().unwrap_or(false) {
-        let _ = s.send_bulk_cmd("run try_auto_burn");
-        std::thread::sleep(Duration::from_millis(300));
-        let _ = s.reset();
-    }
-    match bring_up(Some(Duration::from_secs(20)), progress) {
-        Ok(fresh) => {
-            log::info!("новое окно поймано без переподключения");
-            Ok(fresh)
-        }
-        Err(e) => {
-            log::info!("auto-cycle не сработал ({e}) — ручное переподключение");
-            manual_reconnect(progress)
-        }
-    }
+    manual_reconnect(progress)
 }
 
 /// Ручной перезаход: просим передёрнуть питание колонки, ждём ухода
@@ -144,7 +115,7 @@ fn capture_all_windows(
     let mut last = captured_bytes(&dir);
     let mut stalls = 0u32;
     loop {
-        match aml::backup::capture_pass(&mut s, &dir, progress, window_budget())
+        match aml::backup::capture_pass(&mut s, &dir, progress)
             .context("проход захвата Amlogic")?
         {
             Pass::Done(report) => return Ok((report, s)),
@@ -321,7 +292,6 @@ impl Backend for Amlogic {
                         total: image_len as u64,
                     });
                 },
-                window_budget(),
             )
             .context("проход записи data")?;
             if done {
@@ -614,8 +584,8 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
             let size = usize::from_str_radix(size.trim_start_matches("0x"), 16)
                 .context("dlmem <size>: не hex-число")?;
             anyhow::ensure!(
-                size > 0 && size <= 4 << 20,
-                "dlmem <size>: 1..=0x400000"
+                size > 0 && size <= 8 << 20,
+                "dlmem <size>: 1..=0x800000"
             );
             let armed = s.tpl_cmd(&format!(
                 "download mem {:#x} normal {size:#x}",
@@ -658,6 +628,54 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
                     back.len()
                 );
             }
+            continue;
+        }
+        // "readtest <n>": n кусков «id → nand read 1 МиБ → upload mem»
+        // в одной сессии — меряет, сколько байт вывозит одно окно с
+        // identify-keepalive между кусками (гипотеза: идентификация
+        // продлевает сессию, стена — таймер простоя, а не бюджет).
+        if let Some(rest) = c.strip_prefix("readtest ") {
+            let mut it = rest.split_whitespace();
+            let n: u32 = it.next().context("readtest <n> [size]: не число")?.parse()?;
+            let size: usize = it
+                .next()
+                .map(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16))
+                .transpose()
+                .context("readtest: размер не hex")?
+                .unwrap_or(0x10_0000);
+            anyhow::ensure!(
+                size > 0 && size <= 0x100_0000,
+                "readtest: размер 1..=0x1000000"
+            );
+            for i in 1..=n {
+                let soc = s.identify()?;
+                let t_chunk = Instant::now();
+                let off = 0x100_0000u32 + (i - 1) * size as u32; // misc/boot_a/system — читаемая зона
+                // механика flasher.sh read_big_from_flash: один blocking
+                // `nand read` (молчание устройства абсорбирует blocking
+                // status-read) + один `upload mem` стрим
+                let data = s
+                    .nand_read(amlogic::RAM_SCRATCH, off, size)
+                    .and_then(|_| s.read_dram(amlogic::RAM_SCRATCH, size, &|_| {}));
+                match data {
+                    Ok(d) => log::info!(
+                        "readtest {i}/{n}: id={soc}, nand+upload {:#x} с {off:#x} за {} мс ({} байт)",
+                        size,
+                        t_chunk.elapsed().as_millis(),
+                        d.len()
+                    ),
+                    Err(e) => {
+                        let on_bus = amlogic::present().unwrap_or(false);
+                        log::error!(
+                            "readtest {i}/{n}: кусок не прошёл на {} мс ({e}); устройство {}",
+                            t_chunk.elapsed().as_millis(),
+                            if on_bus { "на шине" } else { "пропало" }
+                        );
+                        anyhow::bail!("readtest прерван на куске {i}");
+                    }
+                }
+            }
+            log::info!("readtest: все {n} кусков прошли в одной сессии");
             continue;
         }
         let r = if let Some((addr, size)) = parse_upload_cmd(c) {

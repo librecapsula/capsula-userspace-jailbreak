@@ -218,17 +218,17 @@ fn bulk_cmd_too_long_rejected_before_the_bus() {
     assert_eq!(s.transport().pos, 0); // nothing was sent
 }
 
-/// Media write (download packet): the 32-byte head of the vendor tool
-/// (disassembled from update 1.5, the build proven against this board):
-/// attempt, length, add_sum at 0x08, chunk index at 0x0c, then u16
-/// checksum-algorithm id (0xef = add_sum) + u16 announced ack length
-/// (0x100; the 1.7.5 build announces 0x200).
+/// Media write (download packet): the 32-byte head — attempt, length,
+/// chunk index at 0x08, add_sum at 0x0c (the live gadget reads it in
+/// this order, confirmed on the wire 2026-10-31: a swapped head is
+/// rejected with «genSum … != org … at seq …»), then u16
+/// checksum-algorithm id (0xef = add_sum) + u16 announced ack length.
 fn media_head(data: &[u8], seq: u32, attempt: u32) -> Vec<u8> {
     let mut head = [0u8; 0x20];
     head[0..4].copy_from_slice(&attempt.to_le_bytes());
     head[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
-    head[8..12].copy_from_slice(&amlogic::add_sum(data).to_le_bytes());
-    head[12..16].copy_from_slice(&seq.to_le_bytes());
+    head[8..12].copy_from_slice(&seq.to_le_bytes());
+    head[12..16].copy_from_slice(&amlogic::add_sum(data).to_le_bytes());
     head[16..18].copy_from_slice(&0x00efu16.to_le_bytes());
     head[18..20].copy_from_slice(&0x0100u16.to_le_bytes());
     head.to_vec()
@@ -532,8 +532,9 @@ fn nand_read_command() {
     s.nand_read(0x0108_0000, 0x0b20_0000, 0x8000).unwrap();
 }
 
-/// read_nand_range: one nand read per NAND_STAGE, then ONE upload mem
-/// arm for the stage streamed in device-paced 64 KiB bursts.
+/// read_nand_range: identify keepalive, one nand read per stage, then
+/// ONE upload mem arm for the stage streamed in device-paced 64 KiB
+/// bursts.
 #[test]
 fn read_nand_range_steps() {
     fn head(left: u32, seq: u32) -> Vec<u8> {
@@ -544,8 +545,10 @@ fn read_nand_range_steps() {
     }
     let mut ok = vec![0u8; BULK_REPLY_LEN];
     ok[..7].copy_from_slice(b"success");
-    // no identify keepalive: the reference flasher does not send any
+    let stage = amlogic::nand::READ_STAGE_MAIN;
     let mut steps = vec![];
+    // identify keepalive opens the stage
+    steps.push(Step::ControlIn(req::IDENTIFY_HOST, 0, 0, vec![0, 7, 0, 16]));
     // sentinel fill of the staging buffer before the read
     steps.push(Step::ControlOut(
         req::BULKCMD,
@@ -553,7 +556,7 @@ fn read_nand_range_steps() {
         2,
         bulkcmd(&format!(
             "echo; mw.b 0x1080000 0xa5 {:#x}",
-            amlogic::NAND_STAGE
+            stage
         )),
     ));
     steps.push(Step::BulkIn(ok.clone()));
@@ -563,7 +566,7 @@ fn read_nand_range_steps() {
         2,
         bulkcmd(&format!(
             "echo; nand read 0x1080000 0xb200000 {:#x}",
-            amlogic::NAND_STAGE
+            stage
         )),
     ));
     steps.push(Step::BulkIn(ok.clone()));
@@ -574,14 +577,14 @@ fn read_nand_range_steps() {
         2,
         bulkcmd(&format!(
             "upload mem 0x1080000 normal {:#x}",
-            amlogic::NAND_STAGE
+            stage
         )),
     ));
     steps.push(Step::BulkIn(ok));
     // the device announces min(left, 64 KiB) per burst
-    let bursts = amlogic::NAND_STAGE / amlogic::UPLOAD_SLOT;
+    let bursts = stage / amlogic::UPLOAD_SLOT;
     for i in 0..bursts {
-        let left = amlogic::NAND_STAGE - i * amlogic::UPLOAD_SLOT;
+        let left = stage - i * amlogic::UPLOAD_SLOT;
         steps.push(Step::ControlIn(
             req::READ_MEDIA,
             0x1000,
@@ -591,10 +594,11 @@ fn read_nand_range_steps() {
         steps.push(Step::BulkIn(vec![(i % 8) as u8; amlogic::UPLOAD_SLOT]));
     }
     let mut s = session(steps);
-    let data = s
-        .read_nand_range(0x0b20_0000, amlogic::NAND_STAGE, &|_| {})
+    let mut data = Vec::new();
+    let n = s
+        .read_nand_range(0x0b20_0000, stage as u32, false, &mut data, &|_| {})
         .unwrap();
-    assert_eq!(data.len(), amlogic::NAND_STAGE);
+    assert_eq!(n, stage);
     assert_eq!(data[0], 0);
     assert_eq!(data[amlogic::UPLOAD_SLOT], 1);
     assert_eq!(data[3 * amlogic::UPLOAD_SLOT], 3);

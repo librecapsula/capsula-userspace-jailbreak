@@ -1,13 +1,14 @@
-//! Fixed A113X NAND geometry and read-only staging operations.
+//! A113X NAND geometry and the streaming read path (the only one).
 
 use crate::transport::Transport;
 use crate::{AmlogicSession, Error, Result, RAM_SCRATCH};
+use std::io::Write;
 
 pub const NAND_SIZE: u32 = 0x1000_0000;
 pub const PAGE_SIZE: u32 = 2048;
 pub const OOB_SIZE: u32 = 64;
-pub const CHUNK_SIZE: u32 = 0x80_0000;
-
+/// AML reserved areas between the bootloader and tpl (device-unique;
+/// never reflashed from a dump).
 pub const RESERVED: &[(&str, u32, u32)] = &[
     ("bbt", 0x28_0000, 0x8_0000),
     ("env", 0x30_0000, 0x10_0000),
@@ -16,6 +17,18 @@ pub const RESERVED: &[(&str, u32, u32)] = &[
     ("ddr", 0x58_0000, 0x4_0000),
 ];
 
+/// Stage size of the streaming read, in MAIN-area bytes: one
+/// `nand read <ram> <off> <n>` moves this much NAND->DRAM, then ONE
+/// `upload mem` arm streams the stage to the host in device-paced
+/// bursts (flasher.sh `read_big_from_flash` mechanics with the
+/// vendor's 8 MiB chunk). Proven live: 20 × 8 MiB stages in one
+/// burning session (~11.7 MB/s) with an identify keepalive per stage.
+pub const READ_STAGE_MAIN: usize = 0x80_0000;
+/// Raw stages (page+OOB) stay at 4 MiB main so the staging buffer with
+/// OOB (4.13 MiB) stays inside the proven DRAM window at RAM_SCRATCH.
+pub const RAW_STAGE_MAIN: usize = 0x40_0000;
+
+/// Logical bytes -> bytes with OOB appended per page.
 pub fn raw_bytes(main_bytes: u32) -> Result<usize> {
     if main_bytes == 0 || main_bytes > NAND_SIZE || !main_bytes.is_multiple_of(PAGE_SIZE) {
         return Err(Error::InvalidArgument("invalid NAND page range".into()));
@@ -46,14 +59,6 @@ impl<T: Transport> AmlogicSession<T> {
         Ok(size as usize)
     }
 
-    pub fn read_nand_chunk(&mut self, offset: u32, main_bytes: u32) -> Result<Vec<u8>> {
-        self.stage_nand(offset, main_bytes, false)
-    }
-
-    pub fn read_raw_nand_chunk(&mut self, offset: u32, main_bytes: u32) -> Result<Vec<u8>> {
-        self.stage_nand(offset, main_bytes, true)
-    }
-
     /// `nand erase <off> <len>` — стирание диапазона логического
     /// пространства. Идемпотентно: прерванное окно просто повторяет
     /// команду в следующем. Границы — кратные странице.
@@ -71,51 +76,130 @@ impl<T: Transport> AmlogicSession<T> {
             .map(|_| ())
     }
 
-    pub fn read_nand_buffer(&mut self, bytes: usize) -> Result<Vec<u8>> {
-        let max = raw_bytes(CHUNK_SIZE)?;
-        if bytes == 0 || bytes > max || RAM_SCRATCH as u64 + bytes as u64 > 0x0190_0000 {
-            return Err(Error::InvalidArgument(
-                "read outside NAND staging buffer".into(),
-            ));
-        }
-        self.bulk_cmd(&format!("upload mem {RAM_SCRATCH:#x} normal {bytes:#x}"))?;
-        let data = self.receive_upload(bytes, &|| false, &|_| {})?;
-        if data.len() != bytes {
-            return Err(Error::InvalidResponse(format!(
-                "short NAND buffer: {} of {bytes} bytes",
-                data.len()
-            )));
-        }
-        Ok(data)
-    }
-
-    fn stage_nand(&mut self, offset: u32, main_bytes: u32, raw: bool) -> Result<Vec<u8>> {
-        if main_bytes == 0
-            || main_bytes > CHUNK_SIZE
-            || offset as u64 + main_bytes as u64 > NAND_SIZE as u64
-        {
+    /// Stream a NAND range to `out` — the one read path of this crate.
+    ///
+    /// Mechanics per stage (flasher.sh `read_big_from_flash`):
+    /// identify keepalive, `mw.b` sentinel, one blocking `nand read`
+    /// (the status read absorbs the whole staging silence), one
+    /// `upload mem` arm, device-paced bursts written straight to `out`
+    /// — a session death keeps every completed stage on disk.
+    ///
+    /// `len` is in MAIN-area bytes; with `raw` the stream carries
+    /// page+OOB (`raw_bytes(len)` total) and the offset is physical.
+    /// Returns the number of bytes written to `out`. A `failed:` from
+    /// the device with a changed staging buffer (bad block past the
+    /// good prefix) still uploads and keeps the received bytes without
+    /// guessing validity from contents; a completely unchanged sentinel
+    /// stops the stream early (a partial result — an entirely empty
+    /// prefix is an error). Transport errors propagate after the
+    /// received prefix is written.
+    pub fn read_nand_range(
+        &mut self,
+        off: u32,
+        len: u32,
+        raw: bool,
+        out: &mut dyn Write,
+        progress: &dyn Fn(usize),
+    ) -> Result<usize> {
+        if len == 0 || off as u64 + len as u64 > NAND_SIZE as u64 {
             return Err(Error::InvalidArgument(
                 "NAND read outside A113X geometry".into(),
             ));
         }
-        let (operation, count, bytes) = if raw {
-            if !offset.is_multiple_of(PAGE_SIZE) {
-                return Err(Error::InvalidArgument("unaligned raw NAND offset".into()));
-            }
-            ("read.raw", main_bytes / PAGE_SIZE, raw_bytes(main_bytes)?)
-        } else {
-            ("read", main_bytes, main_bytes as usize)
-        };
-        self.bulk_cmd(&format!("echo; mw.b {RAM_SCRATCH:#x} 0xa5 {bytes:#x}"))?;
-        self.bulk_cmd(&format!(
-            "echo; nand {operation} {RAM_SCRATCH:#x} {offset:#x} {count:#x}"
-        ))?;
-        let data = self.read_nand_buffer(bytes)?;
-        if data.iter().all(|&byte| byte == 0xa5) {
-            return Err(Error::InvalidResponse(
-                "NAND did not replace the staging buffer".into(),
-            ));
+        if raw && (!off.is_multiple_of(PAGE_SIZE) || !len.is_multiple_of(PAGE_SIZE)) {
+            return Err(Error::InvalidArgument("unaligned raw NAND range".into()));
         }
-        Ok(data)
+        let stage_main = if raw { RAW_STAGE_MAIN } else { READ_STAGE_MAIN } as u32;
+        let mut main_done = 0u32;
+        let mut written = 0usize;
+        while main_done < len {
+            let mut main = (len - main_done).min(stage_main);
+            if raw {
+                main -= main % PAGE_SIZE;
+            }
+            let file_len = if raw { raw_bytes(main)? } else { main as usize };
+
+            // Keepalive: the burning session dies on ~300–450 ms of
+            // device-side idle; the vendor tool identifies before every
+            // operation, and the nand read below leaves the USB stack
+            // untouched for tens of ms.
+            self.identify()?;
+            self.bulk_cmd(&format!("echo; mw.b {RAM_SCRATCH:#x} 0xa5 {file_len:#x}"))?;
+            let (operation, count) = if raw {
+                ("read.raw", main / PAGE_SIZE)
+            } else {
+                ("read", main)
+            };
+            let read_failure = match self.bulk_cmd(&format!(
+                "echo; nand {operation} {RAM_SCRATCH:#x} {:#x} {count:#x}",
+                off + main_done
+            )) {
+                Ok(_) => None,
+                // a bad-block `failed:` does not prove the buffer is
+                // empty: the live gadget fills the whole range and still
+                // answers `failed:` when it skipped a bad block
+                Err(e @ Error::CommandFailed(_)) => Some(e),
+                // anything else is the session dying
+                Err(other) => return Err(other),
+            };
+            self.send_bulk_cmd(&format!("upload mem {RAM_SCRATCH:#x} normal {file_len:#x}"))?;
+            self.wait_bulk_status()?;
+            let mut stage_buf = Vec::with_capacity(file_len);
+            let staged = match self.upload_stream(file_len, &mut stage_buf) {
+                Ok(n) => n,
+                // a dead session still delivered a prefix into the stage
+                // buffer — flush it so the caller's checkpoint keeps it
+                Err(e) => {
+                    if !stage_buf.is_empty() {
+                        out.write_all(&stage_buf)?;
+                    }
+                    return Err(e);
+                }
+            };
+            let unchanged = staged > 0 && stage_buf.iter().all(|&b| b == 0xa5);
+
+            // An all-0xa5 stage is ambiguous: real NAND data or the
+            // untouched sentinel. Never infer a length from contents.
+            if let Some(error) = read_failure {
+                if unchanged {
+                    // the read did not happen at all; keep the prefix
+                    if written == 0 {
+                        return Err(error);
+                    }
+                    log::warn!(
+                        "nand {operation} rejected at {:#x} (+{main_done:#x} of {len:#x}): \
+                         {error} — keeping the prefix",
+                        off + main_done
+                    );
+                    return Ok(written);
+                }
+                log::warn!(
+                    "nand {operation} at {:#x} reported {error}; preserving all {staged:#x} \
+                     uploaded bytes without trimming; NAND completeness is uncertain",
+                    off + main_done
+                );
+            }
+            if unchanged && staged == file_len {
+                return Err(Error::InvalidResponse(format!(
+                    "nand {operation} {:#x}: the staging buffer still holds the sentinel — \
+                     the read did not happen",
+                    off + main_done
+                )));
+            }
+            out.write_all(&stage_buf)?;
+            written += staged;
+            main_done += main;
+            progress(written);
+            if staged < file_len {
+                // short stream (ZLP) mid-stage — keep the prefix
+                log::warn!(
+                    "upload stream ended at {staged:#x} of {file_len:#x} bytes at {:#x}; \
+                     keeping the prefix",
+                    off + main_done
+                );
+                return Ok(written);
+            }
+        }
+        Ok(written)
     }
 }

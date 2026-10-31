@@ -30,6 +30,26 @@ fn session(steps: Vec<Step>) -> AmlogicSession<MockTransport> {
     AmlogicSession::new(MockTransport::new(steps), 0x81, 0x02)
 }
 
+/// The keepalive identify that opens every read stage.
+fn identify() -> Vec<Step> {
+    vec![Step::ControlIn(req::IDENTIFY_HOST, 0, 0, vec![0, 7, 0, 16])]
+}
+
+/// Run read_nand_range collecting the streamed bytes.
+fn read_range(
+    s: &mut AmlogicSession<MockTransport>,
+    off: u32,
+    len: u32,
+    progress: Option<&RefCell<Vec<usize>>>,
+) -> amlogic::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let empty = RefCell::new(Vec::new());
+    let sink = progress.unwrap_or(&empty);
+    let n = s.read_nand_range(off, len, false, &mut out, &|d| sink.borrow_mut().push(d))?;
+    assert_eq!(n, out.len());
+    Ok(out)
+}
+
 #[test]
 fn upload_writer_preserves_split_packets_and_tail() {
     let mut steps = armed("upload store bootloader normal 0x10201");
@@ -235,17 +255,10 @@ fn upload_rejects_unknown_partition_and_oversized_range_before_usb() {
 }
 
 #[test]
-fn staged_nand_read_rejects_burst_larger_than_stage() {
-    let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x200");
-    steps.extend(armed("echo; nand read 0x1080000 0x0 0x200"));
-    steps.extend(armed("upload mem 0x1080000 normal 0x200"));
-    steps.extend([
-        Step::ControlIn(req::READ_MEDIA, 4096, 1, head(1024)),
-        Step::BulkIn(vec![7; 1024]),
-    ]);
-    let mut s = session(steps);
-    assert!(s.read_nand_range(0, 512, &|_| {}).is_err());
-    assert_eq!(s.transport().pos, 7);
+fn nand_range_outside_geometry_is_rejected_before_usb() {
+    let mut s = session(vec![]);
+    assert!(read_range(&mut s, 0x1000_0000, 512, None).is_err());
+    assert_eq!(s.transport().pos, 0);
 }
 
 #[test]
@@ -414,7 +427,8 @@ fn store_size_rejects_unknown_partition_and_invalid_capacities() {
 #[test]
 fn nand_range_keeps_a_full_stage_after_a_bad_block_status() {
     let stage = 0x200usize;
-    let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x200");
+    let mut steps = identify();
+    steps.extend(armed("echo; mw.b 0x1080000 0xa5 0x200"));
     steps.push(Step::ControlOut(
         req::BULKCMD,
         0,
@@ -429,9 +443,7 @@ fn nand_range_keeps_a_full_stage_after_a_bad_block_status() {
     ]);
     let mut s = session(steps);
     let progress = RefCell::new(Vec::new());
-    let data = s
-        .read_nand_range(0, stage, &|done| progress.borrow_mut().push(done))
-        .unwrap();
+    let data = read_range(&mut s, 0, stage as u32, Some(&progress)).unwrap();
     assert_eq!(data, vec![0x42; stage]);
     assert_eq!(*progress.borrow(), [stage]);
     assert_eq!(s.transport().pos, s.transport().steps.len());
@@ -441,7 +453,8 @@ fn nand_range_keeps_a_full_stage_after_a_bad_block_status() {
 /// A failed status provides no trustworthy byte count for trimming it.
 #[test]
 fn nand_range_keeps_a_long_sentinel_suffix_after_failed_status() {
-    let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x200");
+    let mut steps = identify();
+    steps.extend(armed("echo; mw.b 0x1080000 0xa5 0x200"));
     steps.push(Step::ControlOut(
         req::BULKCMD,
         0,
@@ -457,7 +470,7 @@ fn nand_range_keeps_a_long_sentinel_suffix_after_failed_status() {
         Step::BulkIn(payload.clone()),
     ]);
     let mut s = session(steps);
-    let data = s.read_nand_range(0, 0x200, &|_| {}).unwrap();
+    let data = read_range(&mut s, 0, 0x200, None).unwrap();
     assert_eq!(data, payload);
 }
 
@@ -465,7 +478,8 @@ fn nand_range_keeps_a_long_sentinel_suffix_after_failed_status() {
 /// at the start of the range.
 #[test]
 fn nand_range_failed_status_without_data_is_an_error() {
-    let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x200");
+    let mut steps = identify();
+    steps.extend(armed("echo; mw.b 0x1080000 0xa5 0x200"));
     steps.push(Step::ControlOut(
         req::BULKCMD,
         0,
@@ -479,7 +493,7 @@ fn nand_range_failed_status_without_data_is_an_error() {
         Step::BulkIn(vec![0xa5; 0x200]),
     ]);
     let mut s = session(steps);
-    let error = s.read_nand_range(0, 0x200, &|_| {}).unwrap_err();
+    let error = read_range(&mut s, 0, 0x200, None).unwrap_err();
     assert!(error.to_string().contains("failed:"));
     assert_eq!(s.transport().pos, s.transport().steps.len());
 }
@@ -506,7 +520,8 @@ fn tpl_command_over_63_chars_is_refused_before_usb() {
 
 #[test]
 fn nand_range_preserves_a_real_final_a5_byte_after_failed_status() {
-    let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x4");
+    let mut steps = identify();
+    steps.extend(armed("echo; mw.b 0x1080000 0xa5 0x4"));
     steps.extend([
         Step::ControlOut(
             req::BULKCMD,
@@ -523,9 +538,7 @@ fn nand_range_preserves_a_real_final_a5_byte_after_failed_status() {
     ]);
     let mut s = session(steps);
     let progress = RefCell::new(Vec::new());
-    let data = s
-        .read_nand_range(0, 4, &|done| progress.borrow_mut().push(done))
-        .unwrap();
+    let data = read_range(&mut s, 0, 4, Some(&progress)).unwrap();
     assert_eq!(data, [1, 2, 3, 0xa5]);
     assert_eq!(*progress.borrow(), [4]);
     assert_eq!(s.transport().pos, s.transport().steps.len());

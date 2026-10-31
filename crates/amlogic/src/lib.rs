@@ -12,8 +12,9 @@
 //! - timeouts, headers and status strings per the reverse-engineered
 //!   «Amlogic A113X USB Protocol Specification» (AML-A113X-USB-1.0).
 //!   The media-transfer head and the store write flow follow the 1.5
-//!   tool byte-for-byte (sum at 0x08, chunk index at 0x0c, alg 0xef +
-//!   ack length 0x100 at 0x10).
+//!   tool byte-for-byte (chunk index at 0x08, sum at 0x0c — the live
+//!   gadget's order, confirmed on the wire; alg 0xef + ack length 0x100
+//!   at 0x10).
 //!
 //! The USB transport ([`Transport`]/[`NusbTransport`]) lives in this
 //! crate: the Amlogic protocol needs per-request control deadlines,
@@ -39,6 +40,7 @@
 
 pub mod checksum;
 pub mod error;
+pub mod fdt;
 pub mod mock;
 pub mod nand;
 pub mod session;
@@ -52,8 +54,7 @@ pub use checksum::add_sum;
 pub use error::{Error, Result};
 pub use mock::{MockTransport, Step};
 pub use session::{
-    AmlogicSession, BULKCMD_MAX, BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK, NAND_STAGE,
-    UPLOAD_SLOT,
+    AmlogicSession, BULKCMD_MAX, BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK, UPLOAD_SLOT,
 };
 pub use soc::{SocId, Stage, STAGE_MINOR_IPL, STAGE_MINOR_SPL, STAGE_MINOR_TPL};
 pub use transport::{NusbTransport, Transport};
@@ -66,6 +67,8 @@ pub const USB_PID_UPDATE: u16 = 0xc003;
 /// DRAM scratch addresses of the vendor flasher (flasher.sh): the
 /// kernel-load address doubles as the NAND staging buffer.
 pub const RAM_SCRATCH: u32 = 0x0108_0000;
+/// Where `imgread dtb <slot>` unpacks the boot image's device tree.
+pub const DTB_ADDR: u32 = 0x0100_0000;
 /// Where `env export -t` writes the environment text.
 pub const ENV_ADDR: u32 = 0x0200_0000;
 /// Size reserved for the env text.

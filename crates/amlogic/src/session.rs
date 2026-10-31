@@ -508,15 +508,17 @@ impl<T: Transport> AmlogicSession<T> {
     /// `download <store|mem|dtb> <part> <type> <total_size>` command has
     /// armed the transfer.
     ///
-    /// Head layout of the vendor tool, disassembled from update 1.5 (the
-    /// build proven against this board) and identical in structure in
-    /// 1.7.5 (tools/update-macos): attempt 0..2, chunk length, add_sum
-    /// of the chunk at 0x08, chunk index at 0x0c, then a u32 at 0x10
-    /// that is not a magic but two u16 halves: the checksum algorithm
-    /// (0xef = add_sum) and the ack length (0x100 in 1.5; 1.7.5 sends
-    /// `seq << 4` at 0x0c and ack length 0x200). A failed ack READ
-    /// retries the attempt like the vendor tool; failed control/bulk
-    /// sends abort immediately. One attempt owns a 12-minute ack budget.
+    /// Head layout: attempt 0..2, chunk length, chunk index at 0x08,
+    /// add_sum of the chunk at 0x0c, then a u32 at 0x10 that is not a
+    /// magic but two u16 halves: the checksum algorithm (0xef = add_sum)
+    /// and the ack length (0x100). The live A113X gadget reads the index
+    /// from 0x08 and the original sum from 0x0c («genSum … != org … at
+    /// seq …» diagnostic) — the swapped layout of the earlier
+    /// disassembly note is rejected on the wire (measured 2026-10-31);
+    /// the reference Go tool uses the same 0x08=index/0x0c=sum order.
+    /// A failed ack READ retries the attempt like the vendor tool;
+    /// failed control/bulk sends abort immediately. One attempt owns a
+    /// 12-minute ack budget.
     pub fn write_media(&mut self, data: &[u8], seq: u32) -> Result<()> {
         assert!(data.len() <= MEDIA_CHUNK, "packet must be <= MEDIA_CHUNK");
         if data.is_empty() {
@@ -527,8 +529,8 @@ impl<T: Transport> AmlogicSession<T> {
             let mut head = [0u8; 0x20];
             head[0..4].copy_from_slice(&attempt.to_le_bytes());
             head[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
-            head[8..12].copy_from_slice(&add_sum(data).to_le_bytes());
-            head[12..16].copy_from_slice(&seq.to_le_bytes());
+            head[12..16].copy_from_slice(&add_sum(data).to_le_bytes());
+            head[8..12].copy_from_slice(&seq.to_le_bytes());
             head[16..18].copy_from_slice(&MEDIA_ALG_ADDSUM.to_le_bytes());
             head[18..20].copy_from_slice(&MEDIA_ACK_ANNOUNCED.to_le_bytes());
             self.ctrl_out_timeout(req::WRITE_MEDIA, 1, 0xffff, &head, MEDIA_TIMEOUT)?;
@@ -689,6 +691,19 @@ impl<T: Transport> AmlogicSession<T> {
         Ok(out)
     }
 
+    /// Stream the armed `upload mem` transfer straight into a writer
+    /// until `total` bytes arrive or the device ends the stream with a
+    /// ZLP. Returns the bytes written; a short stream is not an error
+    /// (NAND-backed streams end early on staging failure), transport
+    /// errors propagate after the received prefix lands in `out`.
+    pub(crate) fn upload_stream(
+        &mut self,
+        total: usize,
+        out: &mut dyn Write,
+    ) -> Result<usize> {
+        self.receive_upload_to(total, &|| false, out, &|_| {}, false)
+    }
+
     fn receive_upload_to(
         &mut self,
         total: usize,
@@ -784,144 +799,30 @@ impl<T: Transport> AmlogicSession<T> {
             .map(|_| ())
     }
 
-    /// Dump a raw NAND range through DRAM (flasher.sh
-    /// `read_big_from_flash`): a `nand read` stages up to
-    /// [`NAND_STAGE`] in RAM, then ONE `upload mem` arm streams the
-    /// stage to the host in device-paced bursts (the reference flasher's
-    /// mechanics: the device announces every burst in the upload head,
-    /// the host just consumes exactly what is announced).
-    ///
-    /// Error split: a `nand read` REJECTED by the device (`failed:`,
-    /// a bad block after the good prefix) does NOT necessarily mean the
-    /// staging buffer was not written: the live A113X gadget fills the
-    /// whole range and still answers `failed:` when it skipped a bad
-    /// block. The stage is uploaded in both cases. An entirely unchanged
-    /// sentinel buffer is rejected; otherwise uploaded bytes are preserved
-    /// without guessing a valid length from their contents. A failed status
-    /// is logged because NAND completeness remains uncertain.
-    /// A TRANSPORT error is the session dying
-    /// and propagates to the caller, which reconnects and retries the
-    /// same range.
-    pub fn read_nand_range(
-        &mut self,
-        off: u32,
-        len: usize,
-        progress: &dyn Fn(usize),
-    ) -> Result<Vec<u8>> {
-        self.read_nand_range_until(off, len, progress, &|| false)
-    }
-
-    /// [`read_nand_range`] with a cooperative stop: `stop` is polled
-    /// before every burst, so a caller riding a short-lived window
-    /// can exit cleanly mid-stage and finish the command it needs
-    /// before the window closes.
-    pub fn read_nand_range_until(
-        &mut self,
-        off: u32,
-        len: usize,
-        progress: &dyn Fn(usize),
-        stop: &dyn Fn() -> bool,
-    ) -> Result<Vec<u8>> {
-        let mut out = vec![0u8; len];
-        let mut total = 0usize; // bytes received across all stages
-        while total < len {
-            if stop() {
-                break;
-            }
-            let stage = (len - total).min(NAND_STAGE);
-            // the `echo; ` prefix routes the command through the u-boot
-            // shell, exactly as the reference flasher sends it (the
-            // burning dispatcher must not intercept it)
-            self.bulk_cmd(&format!(
-                "echo; mw.b {:#x} 0xa5 {stage:#x}",
-                crate::RAM_SCRATCH
-            ))?;
-            // A bad-block `failed:` does not prove the buffer is empty:
-            // keep the status and upload the stage anyway.
-            let read_failure = match self.nand_read(crate::RAM_SCRATCH, off + total as u32, stage) {
-                Ok(()) => None,
-                Err(e @ Error::CommandFailed(_)) => Some(e),
-                // anything else is the session dying
-                Err(other) => return Err(other),
-            };
-            // arm the whole stage once; the bursts below are paced by
-            // the device (announced in the upload head)
-            self.send_bulk_cmd(&format!(
-                "upload mem {:#x} normal {stage:#x}",
-                crate::RAM_SCRATCH
-            ))?;
-            self.wait_bulk_status()?;
-            let mut staged = 0usize;
-            while staged < stage {
-                if stop() {
-                    break;
-                }
-                // pacing knob for the load-kill diagnosis: a pause
-                // between bursts tells apart a device-side FIFO overrun
-                // (death tracks the burst rate) from a hard device timer
-                // (death tracks wall time regardless of pacing)
-                if let Ok(ms) = std::env::var("AML_BURST_DELAY_MS") {
-                    if let Ok(ms) = ms.parse::<u64>() {
-                        if ms > 0 && staged > 0 {
-                            sleep(Duration::from_millis(ms));
-                        }
-                    }
-                }
-                let (chunk, _head) = self.upload_fetch_bounded(stage - staged, stage - staged)?;
-                if chunk.is_empty() {
-                    return Err(Error::Usb(format!(
-                        "upload mem: stream ended after {staged:#x} of {stage:#x} bytes"
-                    )));
-                }
-                out[total + staged..total + staged + chunk.len()].copy_from_slice(&chunk);
-                staged += chunk.len();
-            }
-
-            // A suffix of 0xa5 is ambiguous: it may be real NAND data,
-            // not untouched staging RAM. Never infer a byte count from
-            // its contents. Preserve every uploaded byte once the buffer
-            // changed; a rejected command still leaves NAND completeness
-            // uncertain and must remain visible in the diagnostic log.
-            let unchanged = staged > 0 && out[total..total + staged].iter().all(|&b| b == 0xa5);
-            if let Some(error) = read_failure {
-                if unchanged {
-                    if stop() {
-                        break;
-                    }
-                    if total == 0 {
-                        return Err(error);
-                    }
-                    log::warn!(
-                        "nand read rejected at {:#x} (+{total:#x} of {len:#x}): {error} \
-                         — keeping the prefix",
-                        off + total as u32
-                    );
-                    break;
-                }
-                log::warn!(
-                    "nand read at {:#x} reported {error}; preserving all {staged:#x} \
-                     uploaded bytes without trimming; NAND completeness is uncertain",
-                    off + total as u32
-                );
-            }
-
-            // a successful read that left the sentinel untouched did
-            // not happen at all (usb_pcd/flasher.sh guard)
-            if staged == stage && out[total..total + stage].iter().all(|&b| b == 0xa5) {
-                return Err(Error::Usb(format!(
-                    "nand read {:#x}: the staging buffer still holds the sentinel — \
-                     the read did not happen",
-                    off + total as u32
-                )));
-            }
-            total += staged;
-            progress(total);
-            if staged < stage {
-                break; // stopped mid-stage
-            }
+    /// Read the device tree of the active boot image (`imgread dtb
+    /// <slot>` unpacks it to [`crate::DTB_ADDR`]) — the device's own
+    /// NAND partition table source. The image is read twice and the
+    /// copies must match (the reference tool's DRAM stability check);
+    /// the blob is truncated to the FDT header's total size.
+    pub fn read_dtb(&mut self, slot: &str) -> Result<Vec<u8>> {
+        self.bulk_cmd(&format!("echo; imgread dtb {slot} {:#x}", crate::DTB_ADDR))?;
+        let a = self.read_dram(crate::DTB_ADDR, 0x1_0000, &|_| {})?;
+        let b = self.read_dram(crate::DTB_ADDR, 0x1_0000, &|_| {})?;
+        if a != b {
+            return Err(Error::InvalidResponse(
+                "DTB не совпал при двойном чтении".into(),
+            ));
         }
-        out.truncate(total);
-        Ok(out)
+        if a.len() < 40 || u32::from_be_bytes(a[0..4].try_into().unwrap()) != 0xd00d_feed {
+            return Err(Error::InvalidResponse("нет FDT на DTB-адресе".into()));
+        }
+        let total = u32::from_be_bytes(a[4..8].try_into().unwrap()) as usize;
+        if total < 40 || total > a.len() {
+            return Err(Error::InvalidResponse(format!(
+                "некорректный размер DTB: {total:#x}"
+            )));
+        }
+        Ok(a[..total].to_vec())
     }
 
     /// Collect a partition upload in memory. An explicit zero upload
