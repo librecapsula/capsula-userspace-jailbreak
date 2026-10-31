@@ -47,8 +47,9 @@ fn main() {
         .extract()
         .unwrap_or_else(|e| die(&format!("cannot extract {image}: {e}")));
     let out = Path::new(&outdir);
+    let _ = std::fs::remove_dir_all(out);
     std::fs::create_dir_all(out).unwrap();
-    let written = write_tree(out, &tree);
+    let written = write_tree(out, &tree, &tree);
     println!("extracted {} entries to {}", written, out.display());
 }
 
@@ -91,7 +92,7 @@ fn open_image(path: &str, volume: u32, peb: Option<u32>, min_io: u32) -> Vec<Opt
     }
 }
 
-fn write_tree(dir: &Path, ino: &Inode) -> usize {
+fn write_tree(dir: &Path, ino: &Inode, root: &Inode) -> usize {
     let Kind::Dir(children) = &ino.kind else {
         return 0;
     };
@@ -103,7 +104,7 @@ fn write_tree(dir: &Path, ino: &Inode) -> usize {
             Kind::Dir(_) => {
                 std::fs::create_dir_all(&path).unwrap();
                 set_mode(&path, child.mode);
-                count += write_tree(&path, child);
+                count += write_tree(&path, child, root);
             }
             Kind::File(data) => {
                 std::fs::write(&path, data).unwrap();
@@ -121,9 +122,49 @@ fn write_tree(dir: &Path, ino: &Inode) -> usize {
             }
             Kind::Fifo => eprintln!("skipped fifo {name}"),
             Kind::Socket => eprintln!("skipped socket {name}"),
+            Kind::Hardlink { target } => {
+                // Only produced by extract_plan; materialize a copy of
+                // the linked content under this name.
+                if let Some(node) = resolve(root, target) {
+                    count += write_node(&path, node);
+                } else {
+                    eprintln!(
+                        "hard link {name} -> {} cannot be resolved",
+                        target.join("/")
+                    );
+                }
+            }
         }
     }
     count
+}
+
+fn write_node(path: &Path, node: &Inode) -> usize {
+    match &node.kind {
+        Kind::File(data) => {
+            std::fs::write(path, data).unwrap();
+            set_mode(path, node.mode);
+        }
+        Kind::Symlink(target) => {
+            let target = String::from_utf8_lossy(target).into_owned();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, path).unwrap();
+        }
+        _ => eprintln!("hard link to a special file at {}", path.display()),
+    }
+    1
+}
+
+/// Navigate a tree path like `["usr", "bin", "tool"]` from the root.
+fn resolve<'a>(root: &'a Inode, path: &[String]) -> Option<&'a Inode> {
+    let mut node = root;
+    for name in path {
+        let Kind::Dir(children) = &node.kind else {
+            return None;
+        };
+        node = &children.iter().find(|(n, _)| n == name)?.1;
+    }
+    Some(node)
 }
 
 #[cfg(unix)]

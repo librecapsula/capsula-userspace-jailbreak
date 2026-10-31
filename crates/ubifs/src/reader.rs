@@ -39,6 +39,19 @@ pub struct Dirent {
     pub itype: u8,
 }
 
+/// The working maps of an extraction pass.
+#[derive(Default)]
+struct Collected {
+    inos: BTreeMap<u32, InoNode>,
+    /// inum → the on-flash position of its ino node (the write order).
+    ino_pos: std::collections::HashMap<u32, u64>,
+    /// Parent inum → dents in original write order.
+    dents: BTreeMap<u32, Vec<DentNode>>,
+    data: BTreeMap<u32, BTreeMap<u32, Vec<u8>>>,
+    /// Host inum → xattrs in original write order.
+    xattrs: BTreeMap<u32, Vec<(String, Vec<u8>)>>,
+}
+
 impl Ubifs {
     /// Open a volume: parse the SB/MST, read the LPT, cross-check the
     /// totals (as in `lpt_init_rd` + the mount checks) and walk the
@@ -277,49 +290,128 @@ impl Ubifs {
         Ok(out)
     }
 
-    /// Extract the whole tree: inodes, dents and data in one pass over
-    /// the leaf cache.
+    /// Extract the whole tree as a plain [`Inode`] tree: hard-linked
+    /// files appear at every link (with the shared content and
+    /// metadata).
     pub fn extract(&self) -> Result<Inode> {
-        let mut inos: BTreeMap<u32, InoNode> = BTreeMap::new();
-        let mut dents: BTreeMap<u32, Vec<DentNode>> = BTreeMap::new();
-        let mut data: BTreeMap<u32, BTreeMap<u32, Vec<u8>>> = BTreeMap::new();
+        let c = self.collect()?;
+        let mut visited = Default::default();
+        self.assemble(&c, UBIFS_ROOT_INO, &[], &mut visited, false)
+    }
 
+    /// Extract the volume into a [`crate::walk::Plan`]: hard links
+    /// become [`Kind::Hardlink`] markers plus link groups with the
+    /// original write order, so that
+    /// [`mkfs_plan`](crate::mkfs::mkfs_plan) can rebuild a byte-identical
+    /// image. Extended attributes land in [`Inode::xattrs`] in their
+    /// original on-flash order.
+    pub fn extract_plan(&self) -> Result<crate::walk::Plan> {
+        let c = self.collect()?;
+        // Pass 1: count the dents per target inum to spot hard links.
+        let mut dent_count: std::collections::HashMap<u32, u32> = Default::default();
+        for list in c.dents.values() {
+            for d in list {
+                *dent_count.entry(d.inum as u32).or_insert(0) += 1;
+            }
+        }
+        let mut visited: std::collections::HashMap<u32, Vec<String>> = Default::default();
+        let root = self.assemble(&c, UBIFS_ROOT_INO, &[], &mut visited, true)?;
+        let mut link_groups = Vec::new();
+        for (inum, path) in &visited {
+            if dent_count.get(inum).copied().unwrap_or(0) > 1 {
+                let Some(ino) = c.inos.get(inum) else {
+                    continue;
+                };
+                let order_key = c.ino_pos.get(inum).copied().unwrap_or(0);
+                link_groups.push(crate::walk::LinkGroup {
+                    tree_path: path.clone(),
+                    nlink: ino.nlink.max(1),
+                    order_key,
+                });
+            }
+        }
+        Ok(crate::walk::Plan { root, link_groups })
+    }
+
+    /// Gather every leaf into the working maps (one pass over the leaf
+    /// cache). Dents and xents are ordered by their on-flash position —
+    /// the original mkfs write order (readdir order); xattr inodes stay
+    /// out of the file tree.
+    fn collect(&self) -> Result<Collected> {
+        let mut c = Collected::default();
+        // (position, node) per kind — position = the write order of the
+        // node on flash.
+        let mut dents: BTreeMap<u32, Vec<(u64, DentNode)>> = BTreeMap::new();
+        let mut xents: Vec<(u64, u32, String, u32)> = Vec::new();
         for leaf in &self.leaves {
             let node = self.leaf_bytes(*leaf)?;
+            let pos = (leaf.lnum as u64) << 32 | leaf.offs as u64;
             match node[20] {
                 UBIFS_INO_NODE => {
                     let ino = InoNode::parse(&node)?;
-                    inos.insert(ino.key.inum, ino);
+                    c.ino_pos.insert(ino.key.inum, pos);
+                    c.inos.insert(ino.key.inum, ino);
                 }
                 UBIFS_DENT_NODE => {
                     let dent = DentNode::parse(&node)?;
-                    dents.entry(dent.key.inum).or_default().push(dent);
+                    dents.entry(dent.key.inum).or_default().push((pos, dent));
                 }
                 UBIFS_DATA_NODE => {
                     let dn = DataNode::parse(&node)?;
                     let content = decompress(dn.compr_type, &dn.data, dn.size as usize)?;
-                    data.entry(dn.key.inum)
+                    c.data
+                        .entry(dn.key.inum)
                         .or_default()
                         .insert(dn.key.block_or_hash, content);
                 }
-                UBIFS_XENT_NODE => { /* xattr entries are not part of the file tree */ }
+                UBIFS_XENT_NODE => {
+                    let xent = DentNode::parse(&node)?;
+                    xents.push((
+                        pos,
+                        xent.key.inum,
+                        String::from_utf8_lossy(&xent.name).into_owned(),
+                        xent.inum as u32,
+                    ));
+                }
                 t => return Err(Error::BadNode(format!("unexpected leaf type {t}"))),
             }
         }
-
-        self.assemble(&inos, &dents, &data, UBIFS_ROOT_INO)
+        for (parent, list) in dents {
+            let mut list = list;
+            list.sort_by_key(|(pos, _)| *pos);
+            c.dents
+                .insert(parent, list.into_iter().map(|(_, d)| d).collect());
+        }
+        xents.sort_by_key(|(pos, _, _, _)| *pos);
+        for (_, host, name, attr_inum) in xents {
+            let value = c
+                .inos
+                .get(&attr_inum)
+                .map(|ino| ino.data.clone())
+                .unwrap_or_default();
+            c.xattrs.entry(host).or_default().push((name, value));
+        }
+        Ok(c)
     }
 
+    /// Assemble the tree of `inum` at `path`. In `plan_mode`, already
+    /// visited non-directories become [`Kind::Hardlink`] markers and
+    /// `visited` records the first-occurrence path of every non-dir.
     fn assemble(
         &self,
-        inos: &BTreeMap<u32, InoNode>,
-        dents: &BTreeMap<u32, Vec<DentNode>>,
-        data: &BTreeMap<u32, BTreeMap<u32, Vec<u8>>>,
+        c: &Collected,
         inum: u32,
+        path: &[String],
+        visited: &mut std::collections::HashMap<u32, Vec<String>>,
+        plan_mode: bool,
     ) -> Result<Inode> {
-        let ino = inos.get(&inum).ok_or_else(|| {
+        let ino = c.inos.get(&inum).ok_or_else(|| {
             Error::NotFound(format!("inode {inum} referenced by index is missing"))
         })?;
+        // Xattr inodes are not part of the file tree.
+        if ino.flags & UBIFS_XATTR_FL != 0 && inum != UBIFS_ROOT_INO {
+            return Err(Error::NotFound(format!("inode {inum} is an xattr inode")));
+        }
         let base = Inode {
             mode: ino.mode,
             uid: ino.uid,
@@ -330,22 +422,43 @@ impl Ubifs {
             atime_nsec: ino.atime_nsec,
             ctime_nsec: ino.ctime_nsec,
             mtime_nsec: ino.mtime_nsec,
+            nlink: ino.nlink,
+            flags: ino.flags,
+            xattrs: c.xattrs.get(&inum).cloned().unwrap_or_default(),
             kind: Kind::Dir(vec![]),
         };
+        let is_dir = ino.mode & 0o170000 == 0o040000;
+        if !is_dir && inum != UBIFS_ROOT_INO {
+            visited.entry(inum).or_insert_with(|| path.to_vec());
+        }
         let kind = match ino.mode & 0o170000 {
             0o040000 => {
                 let mut children = Vec::new();
-                if let Some(list) = dents.get(&inum) {
+                if let Some(list) = c.dents.get(&inum) {
                     for dent in list {
-                        let child = self.assemble(inos, dents, data, dent.inum as u32)?;
-                        children.push((String::from_utf8_lossy(&dent.name).into_owned(), child));
+                        let child_inum = dent.inum as u32;
+                        let name = String::from_utf8_lossy(&dent.name).into_owned();
+                        if plan_mode && visited.contains_key(&child_inum) {
+                            // A later hard-link occurrence (or a
+                            // self-referencing loop): only a marker.
+                            let target = visited[&child_inum].clone();
+                            let mode = c.inos.get(&child_inum).map(|i| i.mode).unwrap_or(0);
+                            children
+                                .push((name, Inode::with_kind(mode, Kind::Hardlink { target })));
+                            continue;
+                        }
+                        let mut child_path = path.to_vec();
+                        child_path.push(name.clone());
+                        let child =
+                            self.assemble(c, child_inum, &child_path, visited, plan_mode)?;
+                        children.push((name, child));
                     }
                 }
                 Kind::Dir(children)
             }
             0o100000 => {
                 let mut content = vec![0u8; ino.size as usize];
-                if let Some(blocks) = data.get(&inum) {
+                if let Some(blocks) = c.data.get(&inum) {
                     for (block, chunk) in blocks {
                         let off = *block as usize * UBIFS_BLOCK_SIZE;
                         if off + chunk.len() > content.len() {

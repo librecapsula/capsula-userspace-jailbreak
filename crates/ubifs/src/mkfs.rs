@@ -2,32 +2,48 @@
 //! (`ubifs-utils/mkfs.ubifs`).
 //!
 //! The order and semantics mirror the original: data writes (children →
-//! dent → the directory's own ino), gc_lnum, the index (`write_index`),
-//! the leb_cnt finalize, the LPT (`ubifs_create_lpt`), the master node
-//! ×2, the superblock (+ the SIG node), the log (a CS node) and the
-//! orphan area. Nodes inside a LEB are aligned to 8 bytes; a LEB tail is
-//! padded with a pad node/0xCE up to min_io and with 0xFF to the end.
+//! dent → the directory's own ino), the deferred content of hard-linked
+//! files, gc_lnum, the index (`write_index`), the leb_cnt finalize, the
+//! LPT (`ubifs_create_lpt`), the master node ×2, the superblock (+ the
+//! SIG node), the log (a CS node) and the orphan area. Nodes inside a
+//! LEB are aligned to 8 bytes; a LEB tail is padded with a pad
+//! node/0xCE up to min_io and with 0xFF to the end.
 
+use std::collections::{HashMap, HashSet};
+
+use crate::compress::{compress, Compr};
 use crate::error::{Error, Result};
 use crate::geometry::{self, Geometry};
-use crate::key::Key;
+use crate::key::{Key, KeyHash};
 use crate::lpt::{create_lpt, Lprops};
 use crate::media::*;
 use crate::tnc::{write_index, IdxEntry, IndexResult, NodeSink};
 use crate::tree::{Inode, Kind};
+use crate::walk::{LinkGroup, Plan};
 
-/// The default compression picked by [`Options::new`].
-///
-/// Write-side compression is not implemented yet (it lands with the
-/// `compress` work), so the default stays `NONE`; once compressed
-/// writes exist the default will mirror mkfs.ubifs ("LZO if built with
-/// LZO, else ZLIB, else none").
-pub const DEFAULT_COMPR: u16 = UBIFS_COMPR_NONE;
+/// The default compression picked by [`Options::new`], mirroring
+/// mkfs.ubifs ("LZO if built with LZO, else ZLIB, else none").
+#[cfg(feature = "lzo")]
+pub const DEFAULT_COMPR: Compr = Compr::Lzo;
+#[cfg(all(not(feature = "lzo"), feature = "zlib"))]
+pub const DEFAULT_COMPR: Compr = Compr::Zlib;
+#[cfg(not(any(feature = "lzo", feature = "zlib")))]
+pub const DEFAULT_COMPR: Compr = Compr::None;
+
+/// The compression used for a per-file "compress me" flag when the
+/// volume default is none (add_file: LZO if built with it, else ZLIB).
+#[cfg(feature = "lzo")]
+const PER_FILE_COMPR: Compr = Compr::Lzo;
+#[cfg(all(not(feature = "lzo"), feature = "zlib"))]
+const PER_FILE_COMPR: Compr = Compr::Zlib;
+#[cfg(not(any(feature = "lzo", feature = "zlib")))]
+const PER_FILE_COMPR: Compr = Compr::None;
 
 /// mkfs options — a mirror of the mkfs.ubifs command line.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Minimum I/O unit size (`-m`).
+    /// Minimum I/O unit size (`-m`); values below 8 are raised to 8, as
+    /// in mkfs.ubifs.
     pub min_io_size: u32,
     /// LEB size (`-e`).
     pub leb_size: u32,
@@ -44,9 +60,22 @@ pub struct Options {
     pub max_bud_bytes: Option<u64>,
     /// Number of lsave entries.
     pub lsave_cnt: u32,
-    /// Default compression (`-x`; compressed writes are byte-compatible
-    /// in structure, see the crate docs).
-    pub default_compr: u16,
+    /// Default compression (`-x`); compressed writes are structurally
+    /// identical but not byte-identical to mkfs.ubifs (different codec
+    /// implementations) — see the crate docs.
+    pub default_compr: Compr,
+    /// The favor threshold in percent (`-X`, default 20, 0 < P < 100):
+    /// with `favor_lzo`, ZLIB wins a block only when it is at least this
+    /// much smaller than LZO.
+    pub favor_percent: u32,
+    /// Make every object owned by root (`-U`).
+    pub squash_uids: bool,
+    /// Space reserved for the superuser, bytes (`-R`); inflated by the
+    /// UBIFS overhead (`add_space_overhead`) when the superblock is
+    /// written.
+    pub reserved_size: u64,
+    /// The name hash function (`-k`, default r5).
+    pub keyhash: KeyHash,
     /// Volume UUID (mkfs.ubifs generates a random one; the crate default
     /// is all zeroes — set your own for reproducible builds).
     pub uuid: [u8; 16],
@@ -75,6 +104,10 @@ impl Options {
             max_bud_bytes: None,
             lsave_cnt: 256,
             default_compr: DEFAULT_COMPR,
+            favor_percent: 20,
+            squash_uids: false,
+            reserved_size: 0,
+            keyhash: KeyHash::R5,
             uuid: [0; 16],
             fmt_version: 4,
             ro_compat_version: 0,
@@ -123,8 +156,60 @@ impl Options {
         if self.fanout as usize > max_fanout {
             return Err(Error::BadGeometry("too high fanout".into()));
         }
+        if self.orph_lebs < UBIFS_MIN_ORPH_LEBS {
+            return Err(Error::BadGeometry("too few orphan LEBs".into()));
+        }
+        if self.orph_lebs >= self.max_leb_cnt - UBIFS_MIN_LEB_CNT {
+            return Err(Error::BadGeometry("too many orphan LEBs".into()));
+        }
+        if self.favor_percent == 0 || self.favor_percent >= 100 {
+            return Err(Error::BadGeometry(format!(
+                "bad favor percent {} (0 < P < 100)",
+                self.favor_percent
+            )));
+        }
+        if self.reserved_size >= (self.leb_size as u64 * self.max_leb_cnt as u64) / 2 {
+            return Err(Error::BadGeometry(format!(
+                "too much reserved space {}",
+                self.reserved_size
+            )));
+        }
+        if !self.default_compr.writable() {
+            return Err(Error::Unsupported(format!(
+                "compression {:?} is not available with the compiled feature set",
+                self.default_compr
+            )));
+        }
+        if let Some(log_lebs) = self.log_lebs {
+            let max_bud = self.max_bud_bytes.unwrap_or_else(|| {
+                geometry::default_max_bud_bytes(
+                    self.leb_size,
+                    self.max_leb_cnt,
+                    self.log_lebs.unwrap_or(UBIFS_MIN_LOG_LEBS),
+                    self.orph_lebs,
+                )
+            });
+            let min = geometry::calc_min_log_lebs(self.leb_size, self.min_io_size, max_bud, 1);
+            if log_lebs < min {
+                return Err(Error::BadGeometry(format!(
+                    "too few log LEBs, expected at least {min}"
+                )));
+            }
+            if log_lebs > self.max_leb_cnt - UBIFS_MIN_LEB_CNT {
+                return Err(Error::BadGeometry("too many log LEBs".into()));
+            }
+        }
         Ok(())
     }
+}
+
+/// `add_space_overhead` (mkfs.ubifs): inflate a reserved-for-user size
+/// so that the user sees `size` bytes after UBIFS overhead.
+fn add_space_overhead(size: u64, fanout: u32) -> u64 {
+    let max_idx_node_sz = idx_node_sz(fanout as usize);
+    let f = if fanout > 3 { fanout >> 1 } else { 2 };
+    let factor = UBIFS_MAX_DATA_NODE_SZ as u64 + ((max_idx_node_sz as u64 * 3) / (f as u64 - 1));
+    size * factor / UBIFS_BLOCK_SIZE as u64
 }
 
 /// A finished image: the LEB contents (None — an empty 0xFF LEB upon
@@ -166,10 +251,38 @@ struct Lst {
     idx_lebs: u32,
 }
 
-/// Build an image from a tree (a full port of mkfs()).
+/// Build an image from a plain tree. Trees containing
+/// [`Kind::Hardlink`] are rejected — build a [`Plan`] instead (see
+/// [`mkfs_plan`]).
 pub fn mkfs(root: &Inode, opts: &Options) -> Result<Image> {
-    opts.validate()?;
     root.validate()?;
+    if contains_hardlink(root) {
+        return Err(Error::Unsupported(
+            "the tree contains hard links; build a walk::Plan instead".into(),
+        ));
+    }
+    mkfs_plan(
+        &Plan {
+            root: root.clone(),
+            link_groups: Vec::new(),
+        },
+        opts,
+    )
+}
+
+fn contains_hardlink(ino: &Inode) -> bool {
+    match &ino.kind {
+        Kind::Dir(children) => children.iter().any(|(_, c)| contains_hardlink(c)),
+        Kind::Hardlink { .. } => true,
+        _ => false,
+    }
+}
+
+/// Build an image from a [`Plan`] (a tree plus hard-link structure), a
+/// full port of mkfs() + `add_multi_linked_files`.
+pub fn mkfs_plan(plan: &Plan, opts: &Options) -> Result<Image> {
+    opts.validate()?;
+    plan.root.validate()?;
 
     // --- init(): the geometry ---
     let max_bud = match opts.max_bud_bytes {
@@ -185,10 +298,11 @@ pub fn mkfs(root: &Inode, opts: &Options) -> Result<Image> {
         Some(v) => v,
         None => geometry::calc_min_log_lebs(opts.leb_size, opts.min_io_size, max_bud, 1) + 2,
     };
+    let min_io_size = opts.min_io_size.max(8); // as in get_options()
     let mut main_lebs =
         opts.max_leb_cnt - UBIFS_SB_LEBS - UBIFS_MST_LEBS - log_lebs - opts.orph_lebs;
     let base = Geometry {
-        min_io_size: opts.min_io_size,
+        min_io_size,
         leb_size: opts.leb_size,
         leb_cnt: 0,
         max_leb_cnt: opts.max_leb_cnt,
@@ -200,7 +314,7 @@ pub fn mkfs(root: &Inode, opts: &Options) -> Result<Image> {
         fanout: opts.fanout,
         lsave_cnt: opts.lsave_cnt,
         fmt_version: opts.fmt_version,
-        default_compr: opts.default_compr,
+        default_compr: opts.default_compr.to_u16(),
         flags: 0,
         uuid: opts.uuid,
         ro_compat_version: opts.ro_compat_version,
@@ -215,9 +329,14 @@ pub fn mkfs(root: &Inode, opts: &Options) -> Result<Image> {
     }
     geom.flags = flags;
     let main_first = geom.main_first() as usize;
-    let (dead_wm, dark_wm) = geometry::watermarks(opts.min_io_size);
+    let (dead_wm, dark_wm) = geometry::watermarks(min_io_size);
 
     let leb_size = opts.leb_size as usize;
+    let deferred_paths: HashSet<Vec<String>> = plan
+        .link_groups
+        .iter()
+        .map(|g| g.tree_path.clone())
+        .collect();
     let mut st = State {
         lebs: vec![None; opts.max_leb_cnt as usize],
         head_lnum: main_first,
@@ -238,14 +357,23 @@ pub fn mkfs(root: &Inode, opts: &Options) -> Result<Image> {
         dead_wm,
         dark_wm,
         leb_size,
-        min_io_size: opts.min_io_size as usize,
+        min_io_size: min_io_size as usize,
         main_first,
         idx_entries: Vec::new(),
         default_compr: opts.default_compr,
+        favor_percent: opts.favor_percent,
+        squash_uids: opts.squash_uids,
+        keyhash: opts.keyhash,
+        inum_by_path: HashMap::new(),
+        deferred_nodes: HashMap::new(),
+        deferred_paths,
     };
 
     // --- write_data(): children → dent → the directory's own ino ---
-    st.add_directory(root, UBIFS_ROOT_INO)?;
+    st.add_directory(&plan.root, UBIFS_ROOT_INO, &[])?;
+    // --- add_multi_linked_files(): deferred content, in hash-table
+    // order (bucket = host inode % 10099, LIFO inside a bucket).
+    st.write_deferred_links(&plan.link_groups)?;
     st.flush_nodes()?;
 
     // --- set_gc_lnum() ---
@@ -340,10 +468,10 @@ pub fn mkfs(root: &Inode, opts: &Options) -> Result<Image> {
 
     // --- write_super() ---
     let sb = Superblock {
-        key_hash: 0,
+        key_hash: opts.keyhash.to_u8(),
         key_fmt: 0,
         flags: geom.flags,
-        min_io_size: opts.min_io_size,
+        min_io_size,
         leb_size: opts.leb_size,
         leb_cnt,
         max_leb_cnt: opts.max_leb_cnt,
@@ -355,8 +483,8 @@ pub fn mkfs(root: &Inode, opts: &Options) -> Result<Image> {
         fanout: opts.fanout,
         lsave_cnt: opts.lsave_cnt,
         fmt_version: opts.fmt_version,
-        default_compr: opts.default_compr,
-        rp_size: 0,
+        default_compr: opts.default_compr.to_u16(),
+        rp_size: add_space_overhead(opts.reserved_size, opts.fanout),
         time_gran: opts.time_gran,
         uuid: opts.uuid,
         ro_compat_version: opts.ro_compat_version,
@@ -403,7 +531,18 @@ struct State {
     min_io_size: usize,
     main_first: usize,
     idx_entries: Vec<IdxEntry>,
-    default_compr: u16,
+    default_compr: Compr,
+    favor_percent: u32,
+    squash_uids: bool,
+    keyhash: KeyHash,
+    /// Tree path → (inum, itype) of every already-allocated node, for
+    /// hard-link resolution.
+    inum_by_path: HashMap<Vec<String>, (u32, u8)>,
+    /// Tree paths that belong to a link group (first occurrences of
+    /// hard-linked files) — pre-populated from the plan.
+    deferred_paths: HashSet<Vec<String>>,
+    /// The deferred nodes collected during the walk, by tree path.
+    deferred_nodes: HashMap<Vec<String>, (Inode, u32)>,
 }
 
 impl State {
@@ -460,7 +599,8 @@ impl State {
     }
 
     /// `write_node`: a node into its own LEB (master, sb, cs): 0xFF up to
-    /// an 8-byte alignment, a pad node/0xCE up to min_io, 0xFF to the end.
+    /// an 8-byte alignment, a pad node/0xCE up to min_io, 0xFF to the
+    /// end.
     fn write_node(&mut self, node: &[u8], lnum: u32) -> Result<()> {
         let alen = node.len().div_ceil(8) * 8;
         let wlen = node.len().div_ceil(self.min_io_size) * self.min_io_size;
@@ -531,22 +671,56 @@ impl State {
     }
 
     /// `add_directory`/`add_non_dir`: the children, the dents, then the
-    /// directory's own ino.
-    fn add_directory(&mut self, dir: &Inode, dir_inum: u32) -> Result<()> {
+    /// directory's own ino. Hard-linked first occurrences are deferred
+    /// to [`State::write_deferred_links`]; later occurrences become
+    /// plain dents onto the first inum.
+    fn add_directory(&mut self, dir: &Inode, dir_inum: u32, path: &[String]) -> Result<()> {
         let children = match &dir.kind {
             Kind::Dir(children) => children,
-            _ => return Err(Error::Other("root must be a directory".into())),
+            _ => return Err(Error::Other("fs root must be a directory".into())),
         };
         let dir_creat_sqnum = self.next_sqnum();
         let mut size = UBIFS_INO_NODE_SZ as u64;
         let mut nlink = 2u32;
 
         for (name, child) in children {
+            let mut child_path = path.to_vec();
+            child_path.push(name.clone());
+
+            // A later hard-link occurrence: only a dent, onto the inum
+            // of the first occurrence (mkfs reuses the inum and rolls
+            // back the allocation — the same net effect).
+            if let Kind::Hardlink { target } = &child.kind {
+                let Some(&(tinum, titype)) = self.inum_by_path.get(target) else {
+                    return Err(Error::NotFound(format!(
+                        "hard link target {:?} has not been visited yet",
+                        target.join("/")
+                    )));
+                };
+                self.add_dent_node(dir_inum, name, tinum, titype)?;
+                size += ((UBIFS_DENT_NODE_SZ + name.len() + 1).div_ceil(8) * 8) as u64;
+                continue;
+            }
+
             let inum = (self.highest_inum + 1) as u32;
             self.highest_inum += 1;
+
+            // A hard-linked first occurrence: register it, emit the dent
+            // and defer the content (add_non_dir returns without writing
+            // anything when st_nlink > 1).
+            if self.deferred_paths.contains(&child_path) {
+                let itype = child.itype();
+                self.inum_by_path.insert(child_path.clone(), (inum, itype));
+                self.deferred_nodes
+                    .insert(child_path, (child.clone(), inum));
+                self.add_dent_node(dir_inum, name, inum, itype)?;
+                size += ((UBIFS_DENT_NODE_SZ + name.len() + 1).div_ceil(8) * 8) as u64;
+                continue;
+            }
+
             let itype = match &child.kind {
                 Kind::Dir(_) => {
-                    self.add_directory(child, inum)?;
+                    self.add_directory(child, inum, &child_path)?;
                     nlink += 1;
                     UBIFS_ITYPE_DIR
                 }
@@ -555,13 +729,15 @@ impl State {
                     child.itype()
                 }
             };
+            self.inum_by_path.insert(child_path, (inum, itype));
             self.add_dent_node(dir_inum, name, inum, itype)?;
             size += ((UBIFS_DENT_NODE_SZ + name.len() + 1).div_ceil(8) * 8) as u64;
         }
 
-        // The directory's ino goes after the children; its creat_sqnum
-        // was reserved before them.
+        // The directory's own xattrs and ino go after the children; the
+        // creat_sqnum was reserved before them.
         self.creat_sqnum = dir_creat_sqnum;
+        let (xattr_cnt, xattr_size, xattr_names) = self.write_xattrs(dir, dir_inum)?;
         let ino = InoNode {
             key: Key::ino(dir_inum),
             creat_sqnum: dir_creat_sqnum,
@@ -573,124 +749,228 @@ impl State {
             ctime_nsec: dir.ctime_nsec,
             mtime_nsec: dir.mtime_nsec,
             nlink,
-            uid: dir.uid,
-            gid: dir.gid,
+            uid: self.effective_id(dir.uid),
+            gid: self.effective_id(dir.gid),
             mode: dir.mode,
-            flags: self.inode_flags(),
-            xattr_cnt: 0,
-            xattr_size: 0,
-            xattr_names: 0,
-            compr_type: self.default_compr,
+            flags: self.inode_flags(dir),
+            xattr_cnt,
+            xattr_size,
+            xattr_names,
+            compr_type: self.default_compr.to_u16(),
             data: vec![],
         };
         self.add_leaf_node(Key::ino(dir_inum), vec![], UBIFS_INO_NODE, ino.to_node(0))?;
         Ok(())
     }
 
-    /// `add_non_dir`: a file (data nodes), a symlink, a device or another
-    /// metadata-only object.
+    /// `add_multi_linked_files`: write the deferred content of
+    /// hard-linked files in `order_key` order. For plans built by
+    /// [`crate::walk::from_directory`] the key encodes mkfs.ubifs's hash
+    /// table walk (bucket = host inode % 10099, LIFO inside a bucket);
+    /// for plans recovered from an image it is the original on-flash
+    /// write order.
+    fn write_deferred_links(&mut self, groups: &[LinkGroup]) -> Result<()> {
+        let mut ordered: Vec<&LinkGroup> = groups.iter().collect();
+        ordered.sort_by_key(|g| g.order_key);
+        for group in ordered {
+            let Some((mut ino, inum)) = self.deferred_nodes.get(&group.tree_path).cloned() else {
+                return Err(Error::NotFound(format!(
+                    "link group {:?} has no first occurrence in the tree",
+                    group.tree_path.join("/")
+                )));
+            };
+            ino.nlink = group.nlink;
+            // add_non_dir allocates the creat_sqnum itself (a single
+            // ++max_sqnum, as in add_multi_linked_files).
+            self.add_non_dir(&ino, inum)?;
+        }
+        Ok(())
+    }
+
+    /// `add_non_dir`: a file (compressed data nodes), a symlink, a
+    /// device or another metadata-only object, then its xattrs and ino.
     fn add_non_dir(&mut self, ino: &Inode, inum: u32) -> Result<()> {
         self.creat_sqnum = self.next_sqnum();
-        match &ino.kind {
+        let mut data_nodes: Vec<(Key, u8, Vec<u8>)> = Vec::new();
+        let (size, inline_data) = match &ino.kind {
             Kind::File(data) => {
-                // add_file: blocks of 4 KiB, all-zero blocks are skipped.
+                // add_file: blocks of 4 KiB, all-zero blocks are skipped,
+                // each block goes through compress_data(). A per-file
+                // COMPR_FL with -x none means "compress this file".
+                let use_compr =
+                    if self.default_compr == Compr::None && ino.flags & UBIFS_COMPR_FL != 0 {
+                        PER_FILE_COMPR
+                    } else {
+                        self.default_compr
+                    };
                 let mut block_no = 0u32;
                 for chunk in data.chunks(UBIFS_BLOCK_SIZE) {
                     if chunk.iter().all(|&b| b == 0) {
                         block_no += 1;
                         continue;
                     }
+                    let (compr_type, payload) = compress(use_compr, self.favor_percent, chunk)?;
                     let dn = DataNode {
                         key: Key::data(inum, block_no),
                         size: chunk.len() as u32,
-                        compr_type: self.default_compr,
+                        compr_type,
                         compr_size: 0,
-                        data: chunk.to_vec(),
+                        data: payload,
                     };
                     let key = dn.key;
-                    self.add_leaf_node(key, vec![], UBIFS_DATA_NODE, dn.to_node(0))?;
+                    data_nodes.push((key, UBIFS_DATA_NODE, dn.to_node(0)));
                     block_no += 1;
                 }
-                let node = InoNode {
-                    key: Key::ino(inum),
-                    creat_sqnum: self.creat_sqnum,
-                    size: data.len() as u64,
-                    atime_sec: ino.atime_sec,
-                    ctime_sec: ino.ctime_sec,
-                    mtime_sec: ino.mtime_sec,
-                    atime_nsec: ino.atime_nsec,
-                    ctime_nsec: ino.ctime_nsec,
-                    mtime_nsec: ino.mtime_nsec,
-                    nlink: 1,
-                    uid: ino.uid,
-                    gid: ino.gid,
-                    mode: ino.mode,
-                    flags: self.inode_flags(),
-                    xattr_cnt: 0,
-                    xattr_size: 0,
-                    xattr_names: 0,
-                    compr_type: self.default_compr,
-                    data: vec![],
-                };
-                let key = node.key;
-                self.add_leaf_node(key, vec![], UBIFS_INO_NODE, node.to_node(0))?;
+                (data.len() as u64, Vec::new())
             }
             kind => {
                 // Metadata-only kinds carry their content inline in the
-                // inode node.
+                // inode node. mkfs.ubifs takes the size from stat: the
+                // length of a symlink target, zero for devices, FIFOs
+                // and sockets.
                 let data = match kind {
                     Kind::Symlink(target) => target.clone(),
                     // The huge-encoded device number (__le64).
                     Kind::Dev { rdev } => rdev.to_le_bytes().to_vec(),
                     Kind::Fifo | Kind::Socket => vec![],
-                    Kind::Dir(_) | Kind::File(_) => unreachable!(),
+                    Kind::Dir(_) | Kind::File(_) | Kind::Hardlink { .. } => unreachable!(),
                 };
-                let node = InoNode {
-                    key: Key::ino(inum),
-                    creat_sqnum: self.creat_sqnum,
-                    size: data.len() as u64,
-                    atime_sec: ino.atime_sec,
-                    ctime_sec: ino.ctime_sec,
-                    mtime_sec: ino.mtime_sec,
-                    atime_nsec: ino.atime_nsec,
-                    ctime_nsec: ino.ctime_nsec,
-                    mtime_nsec: ino.mtime_nsec,
-                    nlink: 1,
-                    uid: ino.uid,
-                    gid: ino.gid,
-                    mode: ino.mode,
-                    flags: self.inode_flags(),
-                    xattr_cnt: 0,
-                    xattr_size: 0,
-                    xattr_names: 0,
-                    compr_type: self.default_compr,
-                    data,
+                let size = match kind {
+                    Kind::Symlink(target) => target.len() as u64,
+                    _ => 0,
                 };
-                let key = node.key;
-                self.add_leaf_node(key, vec![], UBIFS_INO_NODE, node.to_node(0))?;
+                (size, data)
             }
+        };
+        // Data nodes first (add_file), then the xattrs and the ino
+        // (add_inode).
+        for (key, node_type, node) in data_nodes {
+            self.add_leaf_node(key, vec![], node_type, node)?;
         }
+        let (xattr_cnt, xattr_size, xattr_names) = self.write_xattrs(ino, inum)?;
+        let node = InoNode {
+            key: Key::ino(inum),
+            creat_sqnum: self.creat_sqnum,
+            size,
+            atime_sec: ino.atime_sec,
+            ctime_sec: ino.ctime_sec,
+            mtime_sec: ino.mtime_sec,
+            atime_nsec: ino.atime_nsec,
+            ctime_nsec: ino.ctime_nsec,
+            mtime_nsec: ino.mtime_nsec,
+            nlink: ino.nlink,
+            uid: self.effective_id(ino.uid),
+            gid: self.effective_id(ino.gid),
+            mode: ino.mode,
+            flags: self.inode_flags(ino),
+            xattr_cnt,
+            xattr_size,
+            xattr_names,
+            compr_type: self.default_compr.to_u16(),
+            data: inline_data,
+        };
+        let key = node.key;
+        self.add_leaf_node(key, vec![], UBIFS_INO_NODE, node.to_node(0))?;
         Ok(())
     }
 
-    /// use_flags as in add_inode: COMPR_FL when compression is on by
-    /// default.
-    fn inode_flags(&self) -> u32 {
-        if self.default_compr != UBIFS_COMPR_NONE {
-            UBIFS_COMPR_FL
-        } else {
+    /// `add_xattr`: write the xent + xattr-inode pairs of a host inode
+    /// and return the host's (xattr_cnt, xattr_size, xattr_names)
+    /// accounting. `struct ubifs_xent_node` has the same layout as
+    /// `ubifs_dent_node`.
+    fn write_xattrs(&mut self, host: &Inode, host_inum: u32) -> Result<(u32, u32, u32)> {
+        let mut xattr_cnt = 0u32;
+        let mut xattr_size = 0u32;
+        let mut xattr_names = 0u32;
+        for (name, value) in &host.xattrs {
+            let nlen = name.len();
+            // CALC_DENT_SIZE / CALC_XATTR_BYTES accounting.
+            xattr_cnt += 1;
+            xattr_size += ((UBIFS_DENT_NODE_SZ + nlen + 1).div_ceil(8) * 8) as u32;
+            xattr_size += ((UBIFS_INO_NODE_SZ + value.len() + 1).div_ceil(8) * 8) as u32;
+            xattr_names += nlen as u32;
+
+            let attr_inum = (self.highest_inum + 1) as u32;
+            self.highest_inum += 1;
+            let attr_sqnum = self.next_sqnum();
+
+            let xkey = Key::xent(&self.keyhash, host_inum, name.as_bytes())?;
+            let xent = DentNode {
+                key: xkey,
+                inum: attr_inum as u64,
+                itype: UBIFS_ITYPE_REG,
+                cookie: 0,
+                name: name.as_bytes().to_vec(),
+            };
+            // Serialized as a dent; put_node rewrites the common header
+            // with the XENT type and CRC.
+            self.add_leaf_node(
+                xkey,
+                name.as_bytes().to_vec(),
+                UBIFS_XENT_NODE,
+                xent.to_node(0),
+            )?;
+
+            // The xattr inode: mode S_IFREG, XATTR_FL, the host's times
+            // (with zero nsec, as in mkfs.ubifs) and owner.
+            let attr_ino = InoNode {
+                key: Key::ino(attr_inum),
+                creat_sqnum: attr_sqnum,
+                size: value.len() as u64,
+                atime_sec: host.atime_sec,
+                ctime_sec: host.ctime_sec,
+                mtime_sec: host.mtime_sec,
+                atime_nsec: 0,
+                ctime_nsec: 0,
+                mtime_nsec: 0,
+                nlink: 1,
+                uid: self.effective_id(host.uid),
+                gid: self.effective_id(host.gid),
+                mode: 0o100000,
+                flags: UBIFS_XATTR_FL,
+                xattr_cnt: 0,
+                xattr_size: 0,
+                xattr_names: 0,
+                compr_type: self.default_compr.to_u16(),
+                data: value.clone(),
+            };
+            let nkey = attr_ino.key;
+            self.add_leaf_node(nkey, vec![], UBIFS_INO_NODE, attr_ino.to_node(0))?;
+        }
+        Ok((xattr_cnt, xattr_size, xattr_names))
+    }
+
+    /// use_flags as in add_inode: the tree flags pass through (masked),
+    /// COMPR_FL is added when compression is on by default, DIRSYNC only
+    /// for directories.
+    fn inode_flags(&self, ino: &Inode) -> u32 {
+        let mut f =
+            ino.flags & (UBIFS_COMPR_FL | UBIFS_SYNC_FL | UBIFS_IMMUTABLE_FL | UBIFS_APPEND_FL);
+        if matches!(ino.kind, Kind::Dir(_)) && ino.flags & UBIFS_DIRSYNC_FL != 0 {
+            f |= UBIFS_DIRSYNC_FL;
+        }
+        if self.default_compr != Compr::None {
+            f |= UBIFS_COMPR_FL;
+        }
+        f
+    }
+
+    fn effective_id(&self, id: u32) -> u32 {
+        if self.squash_uids {
             0
+        } else {
+            id
         }
     }
 
     /// `add_dent_node`.
     fn add_dent_node(&mut self, dir_inum: u32, name: &str, inum: u32, itype: u8) -> Result<()> {
-        let key = Key::dent(dir_inum, name.as_bytes())?;
+        let key = Key::dent_hashed(&self.keyhash, dir_inum, name.as_bytes())?;
         let dent = DentNode {
             key,
             inum: inum as u64,
-            itype,
             cookie: 0,
+            itype,
             name: name.as_bytes().to_vec(),
         };
         self.add_leaf_node(

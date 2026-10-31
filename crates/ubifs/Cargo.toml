@@ -10,14 +10,24 @@ categories = ["filesystem", "parser-implementations", "embedded"]
 
 [features]
 default = ["zlib", "lzo"]
-# ZLIB (UBIFS_COMPR_ZLIB) data decompression when reading images.
+# ZLIB (UBIFS_COMPR_ZLIB) raw-deflate support: decompression on read,
+# compression on write.
 zlib = ["dep:miniz_oxide"]
-# LZO1X (UBIFS_COMPR_LZO) data decompression when reading images.
-lzo = ["dep:lzo"]
+# LZO1X (UBIFS_COMPR_LZO) support: pure-Rust decompression on read
+# (`lzo`), lzo1x-1 compression on write (`rust-lzo1x`).
+lzo = ["dep:lzo", "dep:rust-lzo1x"]
+# Zstandard (UBIFS_COMPR_ZSTD) support. This pulls in the C libzstd via
+# the `zstd` crate — the crate stays pure-Rust without the feature.
+zstd = ["dep:zstd"]
+# Reading extended attributes of the source tree in `walk::from_directory`.
+xattr = ["dep:xattr"]
 
 [dependencies]
 miniz_oxide = { version = "0.8", optional = true, default-features = false, features = ["with-alloc"] }
 lzo = { version = "0.1", optional = true, default-features = false, features = ["alloc"] }
+rust-lzo1x = { version = "0.4", optional = true }
+zstd = { version = "0.13", optional = true }
+xattr = { version = "1", optional = true }
 
 [dev-dependencies]
 rust-lzo1x = "0.4"

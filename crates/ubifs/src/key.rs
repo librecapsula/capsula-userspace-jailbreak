@@ -56,12 +56,27 @@ impl Key {
         }
     }
 
-    /// A directory entry key (`dent_key_init`).
+    /// A directory entry key with the default R5 hash (`dent_key_init`).
     pub fn dent(inum: u32, name: &[u8]) -> Result<Key> {
+        Key::dent_hashed(&KeyHash::R5, inum, name)
+    }
+
+    /// A directory entry key with an explicit hash function (the
+    /// `-k r5|test` option of mkfs.ubifs).
+    pub fn dent_hashed(hash: &KeyHash, inum: u32, name: &[u8]) -> Result<Key> {
         Ok(Key {
             inum,
             key_type: UBIFS_DENT_KEY,
-            block_or_hash: r5_hash(name)?,
+            block_or_hash: hash.hash(name)?,
+        })
+    }
+
+    /// An xattr entry key (`xent_key_init`).
+    pub fn xent(hash: &KeyHash, inum: u32, name: &[u8]) -> Result<Key> {
+        Ok(Key {
+            inum,
+            key_type: UBIFS_XENT_KEY,
+            block_or_hash: hash.hash(name)?,
         })
     }
 
@@ -117,6 +132,45 @@ impl Ord for Key {
     }
 }
 
+/// The name hash function used for dent/xent keys (the `-k` option of
+/// mkfs.ubifs; the on-flash `key_hash` field of the superblock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyHash {
+    /// The reiserfs-derived R5 hash (`UBIFS_KEY_HASH_R5`, the default).
+    #[default]
+    R5,
+    /// The trivial test hash (`UBIFS_KEY_HASH_TEST`): the first ≤ 4
+    /// bytes of the name as a little-endian u32.
+    Test,
+}
+
+impl KeyHash {
+    /// The on-flash `UBIFS_KEY_HASH_*` value.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            KeyHash::R5 => 0,
+            KeyHash::Test => 1,
+        }
+    }
+
+    /// From the superblock `key_hash` field.
+    pub fn from_u8(v: u8) -> Result<KeyHash> {
+        match v {
+            0 => Ok(KeyHash::R5),
+            1 => Ok(KeyHash::Test),
+            v => other(format!("unknown key hash type {v}")),
+        }
+    }
+
+    /// Hash a name.
+    pub fn hash(&self, name: &[u8]) -> Result<u32> {
+        match self {
+            KeyHash::R5 => r5_hash(name),
+            KeyHash::Test => test_hash(name),
+        }
+    }
+}
+
 /// The R5 name hash (`key_r5_hash`, borrowed from reiserfs): signed char
 /// arithmetic, `a += c << 4; a += c >> 4; a *= 11`, then `key_mask_hash`.
 pub fn r5_hash(name: &[u8]) -> Result<u32> {
@@ -131,6 +185,18 @@ pub fn r5_hash(name: &[u8]) -> Result<u32> {
         a = a.wrapping_mul(11);
     }
     Ok(mask_hash(a))
+}
+
+/// The test hash (`key_test_hash`): the first ≤ 4 name bytes as a
+/// little-endian u32, then `key_mask_hash`.
+pub fn test_hash(name: &[u8]) -> Result<u32> {
+    if name.len() > crate::media::UBIFS_MAX_NLEN {
+        return other(format!("name is too long ({} bytes)", name.len()));
+    }
+    let mut b = [0u8; 4];
+    let len = name.len().min(4);
+    b[..len].copy_from_slice(&name[..len]);
+    Ok(mask_hash(u32::from_le_bytes(b)))
 }
 
 /// `key_mask_hash`: apply the mask and steer away from collisions with

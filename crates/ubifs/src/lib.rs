@@ -42,6 +42,7 @@
 
 pub mod compress;
 pub mod crc;
+pub mod devtable;
 pub mod error;
 pub mod geometry;
 pub mod key;
@@ -52,10 +53,12 @@ pub mod reader;
 pub mod tnc;
 pub mod tree;
 pub mod ubi;
+pub mod walk;
 
+pub use compress::Compr;
 pub use error::{Error, Result};
 pub use geometry::{Geometry, LptGeom};
-pub use key::Key;
+pub use key::{Key, KeyHash};
 pub use lpt::Lprops;
 pub use media::{
     Branch, CommonHeader, CsNode, DataNode, DentNode, IdxNode, InoNode, Master, Superblock,
@@ -63,6 +66,7 @@ pub use media::{
 };
 pub use mkfs::Options as MkfsOptions;
 pub use reader::Ubifs;
+pub use walk::Plan;
 
 /// Extract the tree, apply a mutation and rebuild the image with the
 /// same geometry.
@@ -188,5 +192,126 @@ mod tests {
         let fs2 = Ubifs::new(image2.lebs[..image2.geometry.leb_cnt as usize].to_vec()).unwrap();
         let inum = fs2.lookup("/small.txt").unwrap().unwrap();
         assert_eq!(fs2.read_file(inum, 9).unwrap(), b"replaced!");
+    }
+
+    #[test]
+    fn xattr_write_read_roundtrip() {
+        let mut file = Inode::file(0o644, vec![7u8; 512]);
+        file.xattrs = vec![
+            ("user.test".into(), b"value".to_vec()),
+            ("user.other".into(), b"v2".to_vec()),
+        ];
+        let root = Inode::dir(0o755, vec![("f".into(), file)]);
+
+        let mut opts = mkfs::Options::new(2048, 126976, 128);
+        opts.default_compr = Compr::None;
+        let image = mkfs::mkfs(&root, &opts).unwrap();
+        let fs = Ubifs::new(image.lebs[..image.geometry.leb_cnt as usize].to_vec()).unwrap();
+        fs.verify().unwrap();
+
+        let tree = fs.extract().unwrap();
+        let Kind::Dir(children) = tree.kind else {
+            panic!()
+        };
+        let f = &children.iter().find(|(n, _)| n == "f").unwrap().1;
+        assert_eq!(f.xattrs[0].0, "user.test");
+        assert_eq!(f.xattrs[0].1, b"value");
+        assert_eq!(f.xattrs[1].0, "user.other");
+        assert_eq!(f.xattrs[1].1, b"v2");
+
+        // The host inode accounting follows the mkfs.ubifs formulas.
+        let inum = fs.lookup("/f").unwrap().unwrap();
+        let ino = fs.ino_node(inum).unwrap().unwrap();
+        assert_eq!(ino.xattr_cnt, 2);
+        // ALIGN(56+9+1,8) + ALIGN(160+5+1,8) + ALIGN(56+10+1,8) +
+        // ALIGN(160+2+1,8) = 72+168+72+168 = 480? — compute exactly:
+        let want_size = ((crate::media::UBIFS_DENT_NODE_SZ + 9 + 1).div_ceil(8) * 8
+            + (crate::media::UBIFS_INO_NODE_SZ + 5 + 1).div_ceil(8) * 8
+            + (crate::media::UBIFS_DENT_NODE_SZ + 10 + 1).div_ceil(8) * 8
+            + (crate::media::UBIFS_INO_NODE_SZ + 2 + 1).div_ceil(8) * 8)
+            as u32;
+        assert_eq!(ino.xattr_size, want_size);
+        assert_eq!(ino.xattr_names, (9 + 10) as u32);
+    }
+
+    #[test]
+    fn hardlink_plan_roundtrip() {
+        use crate::walk::{LinkGroup, Plan};
+        let content: Vec<u8> = (0..100_000u32).map(|i| (i % 199) as u8).collect();
+        let root = Inode::dir(
+            0o755,
+            vec![
+                ("a".into(), Inode::file(0o644, content.clone())),
+                (
+                    "d".into(),
+                    Inode::dir(
+                        0o755,
+                        vec![(
+                            "b".into(),
+                            Inode::with_kind(
+                                0o100644,
+                                Kind::Hardlink {
+                                    target: vec!["a".into()],
+                                },
+                            ),
+                        )],
+                    ),
+                ),
+            ],
+        );
+        let plan = Plan {
+            root,
+            link_groups: vec![LinkGroup {
+                tree_path: vec!["a".into()],
+                nlink: 2,
+                order_key: 0,
+            }],
+        };
+        let mut opts = mkfs::Options::new(2048, 126976, 128);
+        opts.default_compr = Compr::None;
+        let image = mkfs::mkfs_plan(&plan, &opts).unwrap();
+        let fs = Ubifs::new(image.lebs[..image.geometry.leb_cnt as usize].to_vec()).unwrap();
+        fs.verify().unwrap();
+
+        let a = fs.lookup("/a").unwrap().unwrap();
+        let b = fs.lookup("/d/b").unwrap().unwrap();
+        assert_eq!(a, b, "both names must resolve to the same inode");
+        assert_eq!(fs.read_file(a, content.len() as u64).unwrap(), content);
+        assert_eq!(fs.ino_node(a).unwrap().unwrap().nlink, 2);
+
+        // And the extract_plan side recovers the hard-link structure.
+        let plan2 = fs.extract_plan().unwrap();
+        assert_eq!(plan2.link_groups.len(), 1);
+        assert_eq!(plan2.link_groups[0].nlink, 2);
+        let image3 = mkfs::mkfs_plan(&plan2, &opts).unwrap();
+        assert_eq!(image3.to_vec(), image.to_vec());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_roundtrip() {
+        use crate::walk;
+        let dir = std::env::temp_dir().join(format!("ubifs-walker-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("file.txt"), b"hello walker").unwrap();
+        std::fs::write(dir.join("sub/data.bin"), vec![42u8; 10_000]).unwrap();
+        std::os::unix::fs::symlink("file.txt", dir.join("sub/alias")).unwrap();
+        std::fs::hard_link(dir.join("file.txt"), dir.join("sub/hard-link")).unwrap();
+
+        let plan = walk::from_directory(&dir, &walk::WalkOptions::default()).expect("walk");
+        assert_eq!(plan.link_groups.len(), 1);
+        assert_eq!(plan.link_groups[0].nlink, 2);
+
+        let mut opts = mkfs::Options::new(2048, 126976, 128);
+        opts.default_compr = Compr::None;
+        let image = mkfs::mkfs_plan(&plan, &opts).unwrap();
+        let fs = Ubifs::new(image.lebs[..image.geometry.leb_cnt as usize].to_vec()).unwrap();
+        fs.verify().unwrap();
+        let inum = fs.lookup("/file.txt").unwrap().unwrap();
+        assert_eq!(fs.read_file(inum, 12).unwrap(), b"hello walker");
+        let link = fs.lookup("/sub/hard-link").unwrap().unwrap();
+        assert_eq!(link, inum);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

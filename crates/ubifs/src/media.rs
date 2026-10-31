@@ -128,6 +128,11 @@ pub const UBIFS_SIG_NODE_SZ: usize = 64;
 pub const UBIFS_BRANCH_SZ: usize = 12 + crate::key::UBIFS_SK_LEN;
 /// Maximum node size (`UBIFS_MAX_NODE_SZ` = largest inode with inline data).
 pub const UBIFS_MAX_NODE_SZ: usize = UBIFS_INO_NODE_SZ + UBIFS_MAX_INO_DATA;
+/// Blocks shorter than this are stored uncompressed
+/// (`UBIFS_MIN_COMPR_LEN`).
+pub const UBIFS_MIN_COMPR_LEN: usize = 128;
+/// Largest data node (`UBIFS_MAX_DATA_NODE_SZ`).
+pub const UBIFS_MAX_DATA_NODE_SZ: usize = UBIFS_DATA_NODE_SZ + UBIFS_BLOCK_SIZE;
 /// Minimum write size (for the lprops watermarks, `MIN_WRITE_SZ`).
 pub const MIN_WRITE_SZ: usize = UBIFS_DATA_NODE_SZ + 8;
 

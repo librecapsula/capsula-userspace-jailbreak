@@ -26,6 +26,14 @@ pub enum Kind {
     Fifo,
     /// A unix socket.
     Socket,
+    /// A hard link to another node of the tree (the path of the first
+    /// occurrence, relative to the root, e.g. `["usr", "bin", "tool"]`).
+    /// Only [`crate::walk::mkfs_plan`] resolves these; plain
+    /// [`crate::mkfs::mkfs`] rejects them.
+    Hardlink {
+        /// The tree path of the linked (first) occurrence.
+        target: Vec<String>,
+    },
 }
 
 /// A filesystem object.
@@ -51,15 +59,23 @@ pub struct Inode {
     pub ctime_nsec: u32,
     /// Modification time, nanoseconds.
     pub mtime_nsec: u32,
+    /// Hard link count (mkfs.ubifs semantics: for hard-linked files the
+    /// number of links *inside* the image).
+    pub nlink: u32,
+    /// `UBIFS_*_FL` inode flags (SYNC/IMMUTABLE/APPEND/DIRSYNC/COMPR);
+    /// mkfs adds `UBIFS_COMPR_FL` automatically when compression is on.
+    pub flags: u32,
+    /// Extended attributes `(name, value)`, written as xent + xattr
+    /// inode pairs (mkfs.ubifs `-x`-independent, per-inode).
+    pub xattrs: Vec<(String, Vec<u8>)>,
     /// The object type and content.
     pub kind: Kind,
 }
 
 impl Inode {
-    /// A directory with mode `mode` (without S_IFMT).
-    pub fn dir(mode: u32, children: Vec<(String, Inode)>) -> Inode {
+    fn defaults(mode: u32, kind: Kind) -> Inode {
         Inode {
-            mode: (mode & 0o7777) | 0o040000,
+            mode,
             uid: 0,
             gid: 0,
             atime_sec: 0,
@@ -68,40 +84,32 @@ impl Inode {
             atime_nsec: 0,
             ctime_nsec: 0,
             mtime_nsec: 0,
-            kind: Kind::Dir(children),
+            nlink: 1,
+            flags: 0,
+            xattrs: Vec::new(),
+            kind,
         }
+    }
+
+    /// A directory with mode `mode` (without S_IFMT).
+    pub fn dir(mode: u32, children: Vec<(String, Inode)>) -> Inode {
+        Inode::defaults((mode & 0o7777) | 0o040000, Kind::Dir(children))
     }
 
     /// A file with mode `mode` (without S_IFMT).
     pub fn file(mode: u32, data: Vec<u8>) -> Inode {
-        Inode {
-            mode: (mode & 0o7777) | 0o100000,
-            uid: 0,
-            gid: 0,
-            atime_sec: 0,
-            ctime_sec: 0,
-            mtime_sec: 0,
-            atime_nsec: 0,
-            ctime_nsec: 0,
-            mtime_nsec: 0,
-            kind: Kind::File(data),
-        }
+        Inode::defaults((mode & 0o7777) | 0o100000, Kind::File(data))
     }
 
     /// A symbolic link.
     pub fn symlink(target: impl Into<Vec<u8>>) -> Inode {
-        Inode {
-            mode: 0o120777,
-            uid: 0,
-            gid: 0,
-            atime_sec: 0,
-            ctime_sec: 0,
-            mtime_sec: 0,
-            atime_nsec: 0,
-            ctime_nsec: 0,
-            mtime_nsec: 0,
-            kind: Kind::Symlink(target.into()),
-        }
+        Inode::defaults(0o120777, Kind::Symlink(target.into()))
+    }
+
+    /// An inode with the full mode (with S_IFMT) and a ready `Kind` —
+    /// the general constructor used by walkers.
+    pub fn with_kind(mode: u32, kind: Kind) -> Inode {
+        Inode::defaults(mode, kind)
     }
 
     /// Set all three timestamps to `t` (seconds).
@@ -131,6 +139,7 @@ impl Inode {
             Kind::Symlink(_) => UBIFS_ITYPE_LNK,
             Kind::Fifo => UBIFS_ITYPE_FIFO,
             Kind::Socket => UBIFS_ITYPE_SOCK,
+            Kind::Hardlink { .. } => UBIFS_ITYPE_REG,
             Kind::Dev { .. } => {
                 // CHR/BLK are told apart by the mode.
                 if self.mode & 0o170000 == 0o060000 {
@@ -165,6 +174,14 @@ impl Inode {
                     return Err(Error::Overflow("symlink target is too long".into()));
                 }
                 _ => {}
+            }
+            for (name, value) in &ino.xattrs {
+                if name.is_empty() || name.len() > crate::media::UBIFS_MAX_NLEN {
+                    return Err(Error::Other(format!("invalid xattr name '{name}'")));
+                }
+                if value.len() > crate::media::UBIFS_MAX_INO_DATA {
+                    return Err(Error::Overflow(format!("xattr '{name}' value is too long")));
+                }
             }
             Ok(())
         }

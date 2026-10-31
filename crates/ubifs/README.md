@@ -97,12 +97,16 @@ builder must keep the parity harness green:
 
 ## Limitations
 
-- Write-side compression is not implemented yet (`-x none` only);
-  reading ZSTD-compressed data is not supported either.
+- Write-side compression produces **valid but not byte-identical**
+  streams: mkfs.ubifs compresses with zlib (raw deflate, 2 KiB window,
+  memLevel 8) and GPL-only `lzo1x_999`; this crate uses pure-Rust codecs
+  (miniz_oxide and lzo1x-1, as the kernel write path does). `-x none`
+  images remain byte-identical.
 - Committed state only: the journal is not replayed (images with a dirty
   journal are read at their last commit).
-- No xattr handling on write, no encrypted (format 5) or authenticated
-  images, no hardlink dedup in the builder yet.
+- Reading ZSTD-compressed data needs the `zstd` feature (it pulls in the
+  C libzstd; everything else is pure Rust).
+- No encrypted (format 5) or authenticated images.
 - Bad-block and wear-leveling management is out of scope (that is UBI's
   job on the device).
 

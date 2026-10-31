@@ -85,7 +85,7 @@ fn stock_volume_rebuilds_and_reopens() {
     opts.fanout = fs.superblock.fanout;
     opts.max_bud_bytes = Some(fs.superblock.max_bud_bytes);
     opts.lsave_cnt = fs.superblock.lsave_cnt;
-    opts.default_compr = ubifs::media::UBIFS_COMPR_NONE;
+    opts.default_compr = ubifs::Compr::None;
     opts.uuid = fs.superblock.uuid;
     opts.fmt_version = fs.superblock.fmt_version;
     opts.ro_compat_version = fs.superblock.ro_compat_version;
