@@ -97,7 +97,7 @@ fn reconnect_window(
     }
     match bring_up(Some(Duration::from_secs(20)), progress) {
         Ok(fresh) => {
-            println!("новое окно поймано без переподключения");
+            log::info!("новое окно поймано без переподключения");
             Ok(fresh)
         }
         Err(e) => {
@@ -113,14 +113,14 @@ fn reconnect_window(
 fn manual_reconnect(
     progress: &dyn Fn(Progress),
 ) -> anyhow::Result<amlogic::AmlogicSession<amlogic::NusbTransport>> {
-    println!(
+    log::info!(
         "Выключите и снова включите питание колонки — USB-кабель не \
          трогайте; я поймаю её на шине."
     );
     let mut reminder = Instant::now();
     while amlogic::present().unwrap_or(false) {
         if reminder.elapsed() >= Duration::from_secs(30) {
-            println!("...плата всё ещё на шине: выдерните питание колонки и вставьте обратно");
+            log::warn!("...плата всё ещё на шине: выдерните питание колонки и вставьте обратно");
             reminder = Instant::now();
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -158,7 +158,7 @@ fn capture_all_windows(
                          проверьте кабель/плату; окно ловится, но данные не идут"
                     );
                 }
-                println!("{reason}");
+                log::info!("{reason}");
                 s = reconnect_window(s, progress)
                     .context("перезаход в окно после исчерпания")?;
             }
@@ -224,7 +224,7 @@ impl Backend for Amlogic {
         // каталог; серийника, по которому кешировать бэкап, у amlogic-мин
         // нет)
         let base = if no_backup {
-            println!(
+            log::info!(
                 "--no-backup: бэкап не снимаю — data будет собран с нуля, \
                  текущее содержимое теряется"
             );
@@ -235,7 +235,7 @@ impl Backend for Amlogic {
             s = session;
             match report.status {
                 aml::backup::Status::Complete => {
-                    println!("готово: захват {} — полный", report.path.display());
+                    log::info!("готово: захват {} — полный", report.path.display());
                     Some(report.path.join("data.bin"))
                 }
                 aml::backup::Status::Warnings => {
@@ -243,7 +243,7 @@ impl Backend for Amlogic {
                     // только data — он публикуется как data.bin только
                     // полным
                     if report.path.join("data.bin").is_file() {
-                        println!(
+                        log::info!(
                             "готово: захват {} — с укороченными разделами \
                              (бед-блоки), раздел data полный",
                             report.path.display()
@@ -295,7 +295,7 @@ impl Backend for Amlogic {
         let data_off = amlogic::partition("data")
             .map(|(_, off, _)| off)
             .ok_or_else(|| anyhow::anyhow!("в карте разделов нет data"))?;
-        println!(
+        log::info!(
             "запись data: {} ({})",
             humansize(image_len as u64),
             out.display()
@@ -337,7 +337,7 @@ impl Backend for Amlogic {
                     humansize(image_len as u64)
                 );
             }
-            println!(
+            log::info!(
                 "записано {} из {} — нужно свежее окно",
                 humansize(st.written as u64),
                 humansize(image_len as u64)
@@ -351,12 +351,12 @@ impl Backend for Amlogic {
 
         // шаг 5: перезагрузка (u-boot reset; гаджет умрёт посреди статуса —
         // это ожидаемо) и ожидание ухода с шины
-        println!("перезагружаю колонку...");
+        log::info!("перезагружаю колонку...");
         let _ = s.bulk_cmd("reset");
         let start = Instant::now();
         while amlogic::present().unwrap_or(false) {
             if start.elapsed() >= REBOOT_WAIT {
-                println!(
+                log::warn!(
                     "колонка не ушла с шины за {} с — проверьте её состояние",
                     REBOOT_WAIT.as_secs()
                 );
@@ -364,7 +364,7 @@ impl Backend for Amlogic {
             }
             std::thread::sleep(POLL_INTERVAL);
         }
-        println!(
+        log::info!(
             "готово: data прошит оверлеем adbd. Дождитесь загрузки колонки и \
              проверьте `adb devices` (PID живого Linux-гаджета amlogic-мин \
              инструмент не знает — следим только за 1b8e:c003)."
@@ -379,11 +379,11 @@ impl Backend for Amlogic {
         let (report, _) = capture_all_windows(s, Path::new("backup"), &progress)
             .context("полный захват Amlogic")?;
         match report.status {
-            aml::backup::Status::Complete => println!(
+            aml::backup::Status::Complete => log::info!(
                 "готово: полный захват {} (на колонку не писалось)",
                 report.path.display()
             ),
-            aml::backup::Status::Warnings => println!(
+            aml::backup::Status::Warnings => log::info!(
                 "готово: захват {} — с укороченными разделами (бед-блоки; \
                  см. manifest.json и файлы .partial; на колонку не писалось)",
                 report.path.display()
@@ -420,7 +420,7 @@ pub(crate) fn bring_up(
                     log::info!("usb: 1b8e:c003 пропал (+{}мс)", start.elapsed().as_millis());
                     seen = false;
                     if !hint_shown {
-                        println!(
+                        log::info!(
                             "окно download-режима закрылось — выключите и снова \
                              включите подключённую колонку, я поймаю следующее"
                         );
@@ -520,14 +520,14 @@ fn confirm_write(
     } else {
         unreachable!("без базы и не fresh запись не запускается")
     };
-    println!("запись data ({}): {mode}", humansize(part_size));
-    print!("продолжить? [y/N] ");
+    log::info!("запись data ({}): {mode}", humansize(part_size));
+    log::info!("продолжить? [y/N]");
     crate::ask_yes()
 }
 
 fn print_step(ev: Progress) {
     if let Progress::Step(msg) = ev {
-        println!("{msg}");
+        log::info!("{msg}");
     }
 }
 
@@ -552,7 +552,7 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
     };
     require_tpl(&soc)?;
     if cmds.is_empty() {
-        println!("{soc}");
+        log::info!("{soc}");
         return Ok(());
     }
     let mut s = s;
@@ -567,14 +567,14 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
         if let Some(n) = c.strip_prefix("cycle ") {
             let n: u32 = n.parse().context("cycle <n>: не число")?;
             for i in 1..=n {
-                println!("cycle {i}/{n}: убиваю окно (run try_auto_burn + port reset)...");
+                log::info!("cycle {i}/{n}: убиваю окно (run try_auto_burn + port reset)...");
                 let _ = s.send_bulk_cmd("run try_auto_burn");
                 std::thread::sleep(Duration::from_millis(300));
                 let _ = s.reset();
                 let caught = Instant::now();
                 s = bring_up(Some(Duration::from_secs(30)), &progress)
                     .context(format!("cycle {i}: новое окно не поймано за 30 с"))?;
-                println!(
+                log::info!(
                     "cycle {i}/{n}: новое окно за {} мс — стримлю 4 МиБ...",
                     caught.elapsed().as_millis()
                 );
@@ -582,7 +582,7 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
                 let data = s
                     .upload_read(amlogic::RAM_SCRATCH, 0x400_000)
                     .context(format!("cycle {i}: стрим не прошёл"))?;
-                println!(
+                log::info!(
                     "cycle {i}/{n}: {} байт за {} мс (окно живо)",
                     data.len(),
                     st.elapsed().as_millis()
@@ -593,7 +593,7 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
         // "sleep <ms>": хостовая пауза, ничего не отправляется
         if let Some(ms) = c.strip_prefix("sleep ") {
             let ms: u64 = ms.parse().context("sleep <ms>: не число")?;
-            println!("пауза {ms}мс (ничего не отправляется)...");
+            log::info!("пауза {ms}мс (ничего не отправляется)...");
             std::thread::sleep(Duration::from_millis(ms));
             continue;
         }
@@ -601,7 +601,7 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
         // инструмент идентифицирует перед каждой операцией)
         if c == "id" {
             let soc = s.identify()?;
-            println!("id -> {soc} (+{}мс)", t0.elapsed().as_millis());
+            log::info!("id -> {soc} (+{}мс)", t0.elapsed().as_millis());
             continue;
         }
         // "dlmem <size>": probe-download в DRAM (флеш не трогается):
@@ -621,7 +621,7 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
                 "download mem {:#x} normal {size:#x}",
                 amlogic::RAM_SCRATCH
             ))?;
-            println!(
+            log::info!(
                 "dlmem {size:#x}: arm -> {armed} (+{}мс)",
                 t0.elapsed().as_millis()
             );
@@ -633,7 +633,7 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
             let st = s
                 .bulk_cmd("download get_status")
                 .context("dlmem: get_status не отработал")?;
-            println!(
+            log::info!(
                 "dlmem {size:#x}: get_status -> {st} (+{}мс), читаю обратно...",
                 t0.elapsed().as_millis()
             );
@@ -646,7 +646,7 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
                 .filter(|(a, b)| a != b)
                 .count();
             if diff == 0 && back.len() == size {
-                println!(
+                log::info!(
                     "dlmem {size:#x}: сверка сошлась, все {size:#x} байт на месте (+{}мс)",
                     t0.elapsed().as_millis()
                 );
@@ -661,7 +661,7 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
             continue;
         }
         let r = if let Some((addr, size)) = parse_upload_cmd(c) {
-            println!("читаю {size:#x} байт с {addr:#x}...");
+            log::info!("читаю {size:#x} байт с {addr:#x}...");
             s.upload_read(addr, size).map(|data| {
                 // большой поток — только начало + итог; hexdump 8 МиБ
                 // никому не нужен
@@ -678,7 +678,7 @@ pub(crate) fn passthrough(wait: Option<Duration>, cmds: &[String]) -> anyhow::Re
                 .map(|st| format!("{st} (+{}мс)", t0.elapsed().as_millis()))
         };
         match r {
-            Ok(status) => println!("{c} -> {status}"),
+            Ok(status) => log::info!("{c} -> {status}"),
             Err(e) => {
                 let on_bus = amlogic::present().unwrap_or(false);
                 bail!(

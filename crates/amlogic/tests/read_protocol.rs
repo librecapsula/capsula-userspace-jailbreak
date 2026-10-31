@@ -275,7 +275,7 @@ fn malformed_prime_status_is_not_retried_as_a_pipe_failure() {
     // it`) instead of resending the command or declaring the pipe dead;
     // the next text, whatever it says, is the reply — and the prime
     // accepts it: the pipe works, the sacrificial reply is meaningless.
-    let mut steps = vec![
+    let steps = vec![
         Step::ControlOut(req::BULKCMD, 0, 2, command("echo")),
         Step::BulkIn(vec![]),
         Step::BulkIn(b"garbage\0".to_vec()),

@@ -9,6 +9,7 @@
 
 mod amlogic;
 mod backend;
+mod logging;
 mod progress;
 mod rockchip;
 mod util;
@@ -61,20 +62,45 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Логгер — первым: весь вывод инструмента (включая финальную ошибку)
+    // идёт через него, с метками до миллисекунд.
+    logging::init();
     // An elevated relaunch (Windows UAC manifest) may start in
     // C:\Windows\System32; the tool writes backup/work relative to
     // the CWD, so move next to the executable in that case.
     if let Some(cwd) = win_drv::fix_cwd_if_system32() {
-        eprintln!("рабочий каталог: {}", cwd.display());
+        log::info!("рабочий каталог: {}", cwd.display());
     }
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     let wait = if cli.wait == 0 {
         None
     } else {
         Some(Duration::from_secs(cli.wait))
     };
-    let result = match cli.command {
+    // Сценарий — во внутренней функции: ни `?`, ни `bail!` внутри неё не
+    // прокидывают ошибку мимо перехвата ниже (иначе рантайм печатает
+    // «Error: …» без метки времени).
+    let result = run(cli, wait);
+    if let Err(e) = &result {
+        log::error!("{e:?}");
+    }
+    // Launched from a normal console, Windows elevates the tool into a
+    // NEW console window (see the UAC manifest note in .cargo/config.toml);
+    // keep that window open so the output is readable. A shared terminal
+    // or a redirected/none console gets no pause.
+    win_drv::pause_if_own_console();
+    match result {
+        Ok(()) => Ok(()),
+        // Ошибка уже залогирована с меткой времени; выходим молча и с
+        // кодом 1, чтобы рантайм не напечатал её второй раз («Error: …»).
+        Err(_) => std::process::exit(1),
+    }
+}
+
+/// Разбор подкоманды и запуск сценария; все ошибки — через возвращаемое
+/// значение (перехватываются в main и логируются с меткой времени).
+fn run(cli: Cli, wait: Option<Duration>) -> anyhow::Result<()> {
+    match cli.command {
         None => pick_backend(wait)?.jailbreak(cli.yes, cli.format_userdata, cli.no_backup, wait),
         Some(Command::Backup) => {
             if cli.no_backup {
@@ -87,13 +113,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Monitor) => monitor_bus(),
         // Пасстру — диагностика Amlogic-мин, вне основного сценария.
         Some(Command::Aml { cmds }) => amlogic::passthrough(wait, &cmds),
-    };
-    // Launched from a normal console, Windows elevates the tool into a
-    // NEW console window (see the UAC manifest note in .cargo/config.toml);
-    // keep that window open so the output is readable. A shared terminal
-    // or a redirected/none console gets no pause.
-    win_drv::pause_if_own_console();
-    result
+    }
 }
 
 /// Все известные платформы в порядке опроса. Будущая платформа
@@ -129,7 +149,7 @@ fn pick_backend(wait: Option<Duration>) -> anyhow::Result<Box<dyn backend::Backe
         if !hint_shown {
             for b in &candidates {
                 if let Some(h) = b.wait_hint() {
-                    println!("{h}");
+                    log::info!("{h}");
                 }
             }
             hint_shown = true;
@@ -146,46 +166,26 @@ fn pick_backend(wait: Option<Duration>) -> anyhow::Result<Box<dyn backend::Backe
 /// Живой лог USB-событий обоих вендоров: rockchip-монитор (2207:*) плюс
 /// отслеживание появления/пропадания 1b8e:c003.
 fn monitor_bus() -> anyhow::Result<()> {
-    println!("Монитор USB (2207:* rockchip, 1b8e:c003 amlogic), Ctrl-C — выход.");
+    log::info!("Монитор USB (2207:* rockchip, 1b8e:c003 amlogic), Ctrl-C — выход.");
     let mut m = rockusb::DeviceMonitor::new();
     let mut amlogic_on_bus = ::amlogic::present().unwrap_or(false);
     m.poll()?;
     if let Some(best) = rockusb::transport::DeviceMode::best(m.modes()) {
-        println!("сейчас на шине: 2207:{:04x} ({})", best.pid(), best.label());
+        log::info!("сейчас на шине: 2207:{:04x} ({})", best.pid(), best.label());
     }
     if amlogic_on_bus {
-        println!(
-            "[{}] сейчас на шине: 1b8e:c003 (amlogic download)",
-            util::ts()
-        );
+        log::info!("сейчас на шине: 1b8e:c003 (amlogic download)");
     }
     loop {
-        for ev in m.poll()? {
-            match ev {
-                rockusb::monitor::MonitorEvent::Appeared(mode) => {
-                    println!(
-                        "[{}] появился 2207:{:04x} ({})",
-                        util::ts(),
-                        mode.pid(),
-                        mode.label()
-                    )
-                }
-                rockusb::monitor::MonitorEvent::Disappeared(mode) => {
-                    println!(
-                        "[{}] пропал   2207:{:04x} ({})",
-                        util::ts(),
-                        mode.pid(),
-                        mode.label()
-                    )
-                }
-            }
-        }
+        // события 2207:* логирует сам rockusb::DeviceMonitor (usb:
+        // appeared/gone); здесь следим только за amlogic-гаджетом.
+        m.poll()?;
         let now = ::amlogic::present().unwrap_or(amlogic_on_bus);
         if now != amlogic_on_bus {
             if now {
-                println!("[{}] появился 1b8e:c003 (amlogic download)", util::ts());
+                log::info!("появился 1b8e:c003 (amlogic download)");
             } else {
-                println!("[{}] пропал   1b8e:c003 (amlogic download)", util::ts());
+                log::info!("пропал   1b8e:c003 (amlogic download)");
             }
             amlogic_on_bus = now;
         }

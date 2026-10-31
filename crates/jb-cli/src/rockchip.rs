@@ -101,18 +101,18 @@ impl Backend for Rockchip {
         let dev = dump_all(wait, &self.config, &mut self.drivers, false)?;
         let where_ = backup_dir(&dev.serial).display().to_string();
         if dev.firstgen {
-            println!(
+            log::info!(
                 "первое поколение: полный дамп невозможен (BootROM залочен) — \
                  читаемы только разделы ниже 32 МиБ, дамп НЕцелостный"
             );
         }
         if dev.dumped {
-            println!(
+            log::info!(
                 "готово: дампы {} — в {where_} (на колонку не писалось)",
                 dev.serial
             );
         } else {
-            println!(
+            log::info!(
                 "бэкап {} уже есть в {where_} — делать нечего (удалите \
                  каталог, чтобы снять дамп заново)",
                 dev.serial
@@ -146,7 +146,7 @@ fn dump_all(
     no_backup: bool,
 ) -> anyhow::Result<Device> {
     if win_drv::any_rockchip_node_misbound() {
-        println!("устройство Rockchip без WinUSB — ставлю драйвер");
+        log::info!("устройство Rockchip без WinUSB — ставлю драйвер");
         start_or_wait_drivers(drivers, Duration::from_secs(180));
     }
 
@@ -157,7 +157,7 @@ fn dump_all(
             Err(e) => {
                 let binding_error = win_drv::chain_is_binding_error(&e);
                 if binding_error && attempt < ATTEMPTS {
-                    println!(
+                    log::warn!(
                         "узел перехвачен чужим драйвером (попытка {attempt}/{ATTEMPTS}) — перевязываю"
                     );
                     start_or_wait_drivers(drivers, Duration::from_secs(120));
@@ -186,9 +186,9 @@ fn dump_all(
 fn start_or_wait_drivers(drivers: &mut win_drv::Session, settle: Duration) {
     match drivers.ensure_supervision() {
         Ok(()) => {
-            println!("ставлю драйвер WinUSB (до {} с)...", settle.as_secs());
+            log::info!("ставлю драйвер WinUSB (до {} с)...", settle.as_secs());
             if !win_drv::wait_until_bound(settle) {
-                println!(
+                log::warn!(
                     "драйвер не установился за {} с (лог: {})",
                     settle.as_secs(),
                     drivers.log_path().display()
@@ -196,7 +196,7 @@ fn start_or_wait_drivers(drivers: &mut win_drv::Session, settle: Duration) {
             }
         }
         Err(e) => {
-            println!(
+            log::warn!(
                 "не удалось запустить драйверную сессию: {e}\n  \
                  ручной путь: DRIVER-SETUP.txt (Zadig)\n  лог: {}",
                 drivers.log_path().display()
@@ -230,20 +230,20 @@ fn dump_all_once(
     let serial = up.serial;
     let firstgen = up.firstgen;
     let mut s = up.session;
-    println!("серийник колонки: {serial}");
+    log::info!("серийник колонки: {serial}");
     let dir = backup_dir(&serial);
     // A verified backup of THIS column exists -> skip the dump
     // and go straight to the userdata write. On the stock loader
     // (first generation) the dump is NOT intact: everything above
     // the 32 MiB read mask goes in as 0xCC — backup() says so itself.
     let dumped = if no_backup {
-        println!(
+        log::info!(
             "--no-backup: бэкап не проверяю и не снимаю — userdata будет \
              собран с нуля, текущее содержимое теряется"
         );
         false
     } else if BackupStore::exists_verified(&dir) {
-        println!(
+        log::info!(
             "бэкап уже есть в {} — дамп пропускаю (удалите каталог, чтобы \
              снять заново)",
             dir.display()
@@ -276,7 +276,7 @@ fn write_userdata(
     wait: Option<Duration>,
 ) -> anyhow::Result<()> {
     if dev.firstgen {
-        println!(
+        log::info!(
             "первое поколение {} (стоковый лоадер): бэкап нецелостный \
              (маска 0xCC выше 32 МиБ), userdata будет собран с нуля",
             dev.serial
@@ -295,7 +295,7 @@ fn write_userdata(
         .context("в GPT колонки нет раздела userdata")?;
     let part_size = part.sectors * 512;
     if dev.firstgen {
-        println!("раздел userdata: {} (из GPT колонки)", humansize(part_size));
+        log::info!("раздел userdata: {} (из GPT колонки)", humansize(part_size));
     }
 
     let fresh = dev.firstgen || format_userdata || no_backup;
@@ -367,8 +367,8 @@ fn confirm_write(
     } else {
         "оверлей adbd поверх дампа, содержимое сохраняется"
     };
-    println!("запись userdata ({}): {mode}", humansize(part_size));
-    print!("продолжить? [y/N] ");
+    log::info!("запись userdata ({}): {mode}", humansize(part_size));
+    log::info!("продолжить? [y/N]");
     crate::ask_yes()
 }
 
@@ -378,24 +378,24 @@ fn reboot_and_wait(
     s: &mut rockusb::LoaderSession<NusbTransport>,
     wait: Option<Duration>,
 ) -> anyhow::Result<()> {
-    println!("перезагружаю колонку...");
+    log::info!("перезагружаю колонку...");
     let _ = s.reset(RESET_SUBCODE_NORMAL);
     wait_for_adb_gadget(wait)
 }
 
 fn wait_for_adb_gadget(wait: Option<Duration>) -> anyhow::Result<()> {
-    println!(
+    log::info!(
         "жду ADB-гаджет (2207:0006; должен продержаться {} с)...",
         GADGET_STABLE.as_secs()
     );
     rockusb::monitor::wait_gadget_stable(GADGET_STABLE, wait)
         .context("ADB-гаджет не поднялся (или мигнул и пропал) — проверьте загрузку колонки")?;
-    println!("готово: ADB поднят — adb shell даёт root без авторизации");
+    log::info!("готово: ADB поднят — adb shell даёт root без авторизации");
     Ok(())
 }
 
 fn print_step(ev: Progress) {
     if let Progress::Step(msg) = ev {
-        println!("{msg}");
+        log::info!("{msg}");
     }
 }

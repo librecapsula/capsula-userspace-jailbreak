@@ -111,7 +111,7 @@ pub fn wait_download_mode(timeout: Option<Duration>, hint: &str) -> Result<Devic
         }
         if !hint_shown {
             if !hint.is_empty() {
-                println!("{hint}");
+                log::info!("{hint}");
             }
             hint_shown = true;
         }

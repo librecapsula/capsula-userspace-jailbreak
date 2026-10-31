@@ -1,5 +1,5 @@
 //! Мелкие общие помощники CLI (форматирование, время) — используются
-//! обоими бэкендами и монитором шины.
+//! обоими бэкендами, единым логгером и монитором шины.
 
 /// Человекочитаемый размер: 166463 * 512 -> "81.5 MiB".
 pub(crate) fn humansize(bytes: u64) -> String {
@@ -39,24 +39,26 @@ pub(crate) fn utc_now_iso() -> String {
     format!("{y:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-/// Метка времени HH:MM:SS для живого лога монитора.
-pub(crate) fn ts() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| {
+/// Метка времени HH:MM:SS.mmm (UTC) — префикс каждой строки единого
+/// логгера (logging.rs).
+pub(crate) fn ts_ms() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => {
             let secs = d.as_secs() % 86400;
             format!(
-                "{:02}:{:02}:{:02}",
+                "{:02}:{:02}:{:02}.{:03}",
                 secs / 3600,
                 (secs / 60) % 60,
-                secs % 60
+                secs % 60,
+                d.subsec_millis()
             )
-        })
-        .unwrap_or_default()
+        }
+        Err(_) => String::from("00:00:00.000"),
+    }
 }
 
 /// 16 байт в строке, с колонкой адреса (диагностический hexdump
-/// passthrough-команд).
+/// passthrough-команд); каждая строка — запись логгера.
 pub(crate) fn hexdump(data: &[u8], base: u32) {
     for (row, chunk) in data.chunks(16).enumerate() {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
@@ -70,7 +72,7 @@ pub(crate) fn hexdump(data: &[u8], base: u32) {
                 }
             })
             .collect();
-        println!(
+        log::info!(
             "{:08x}  {:<47}  |{}|",
             base + (row * 16) as u32,
             hex.join(" "),

@@ -1,8 +1,26 @@
-//! CLI progress: step lines to stdout, partitions as indicatif bars.
+//! CLI progress: step lines through the unified logger, partitions as
+//! indicatif bars.
 
 use indicatif::{ProgressBar, ProgressStyle};
 use jb_core::session::Progress;
 use std::cell::RefCell;
+use std::sync::Mutex;
+
+/// Активная полоса — глобально: логгер (logging.rs) обязан приостанавливать
+/// её отрисовку на время записи строки (предупреждения из доменных крейтов
+/// приходят и посреди передачи). Одновременно активна максимум одна
+/// полоса — сценариев в процессе ровно один.
+static ACTIVE_BAR: Mutex<Option<ProgressBar>> = Mutex::new(None);
+
+pub(crate) fn active_bar() -> Option<ProgressBar> {
+    ACTIVE_BAR.lock().ok()?.clone()
+}
+
+fn set_active_bar(bar: Option<ProgressBar>) {
+    if let Ok(mut active) = ACTIVE_BAR.lock() {
+        *active = bar;
+    }
+}
 
 pub struct CliProgress {
     bar: RefCell<Option<ProgressBar>>,
@@ -19,7 +37,7 @@ impl CliProgress {
         match p {
             Progress::Step(msg) => {
                 self.finish_bar();
-                println!("{msg}");
+                log::info!("{msg}");
             }
             Progress::PartitionStart { name, sectors } => {
                 self.finish_bar();
@@ -31,6 +49,7 @@ impl CliProgress {
                     .unwrap(),
                 );
                 pb.set_message(name);
+                set_active_bar(Some(pb.clone()));
                 *self.bar.borrow_mut() = Some(pb);
             }
             Progress::PartitionProgress { done, total, .. } => {
@@ -51,6 +70,7 @@ impl CliProgress {
                     .unwrap(),
                 );
                 pb.set_message(name);
+                set_active_bar(Some(pb.clone()));
                 *self.bar.borrow_mut() = Some(pb);
             }
             Progress::TransferProgress { done, total, .. } => {
@@ -67,6 +87,7 @@ impl CliProgress {
     fn finish_bar(&self) {
         if let Some(b) = self.bar.borrow_mut().take() {
             b.finish_and_clear();
+            set_active_bar(None);
         }
     }
 }
