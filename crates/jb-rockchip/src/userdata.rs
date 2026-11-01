@@ -1,68 +1,21 @@
-//! userdata overlay: base image + overlay files -> a partition image
-//! ready to flash. The filesystem is modified in place with ext4-lwext4
-//! (an lwext4 wrapper): mount a copy, write the files, unmount, then
-//! re-read and verify the result.
+//! The ext4 userdata overlay builder: base image + overlay files -> a
+//! partition image ready to flash. The filesystem is modified in place
+//! with ext4-lwext4 (an lwext4 wrapper): mount a copy, write the files,
+//! unmount, then re-read and verify the result.
 //!
-//! The stock firmware mounts userdata as ext2 at /data and uses
-//! /data/overlay/upper as the overlayfs upper layer over the read-only
-//! rootfs. Files placed at /overlay/upper/* inside the partition appear
-//! at the root of the running system; a factory reset wipes /data and
-//! reverts the jailbreak.
+//! The stock rockchip firmware mounts userdata as ext2 at /data and
+//! uses /data/overlay/upper as the overlayfs upper layer over the
+//! read-only rootfs. Files placed at /overlay/upper/* inside the
+//! partition appear at the root of the running system; a factory reset
+//! wipes /data and reverts the jailbreak.
 //!
 //! userdata is not signed and can be rewritten freely — it is the only
 //! partition the tool writes.
 
-use crate::session::Progress;
+use jb_core::overlay::{LAYOUT_DIRS, OverlayFile};
+use jb_core::progress::{Progress, ProgressFn};
 use ext4_lwext4::{Ext4Fs, FileBlockDevice, MkfsOptions, OpenFlags};
 use std::path::Path;
-
-/// Prefix inside userdata: the overlayfs upper layer. Files placed here
-/// show up at the root of the running system.
-pub const UPPER_DIR: &str = "/overlay/upper";
-
-/// Dirs the stock boot scripts expect to exist in userdata: overlayfs
-/// needs an EMPTY workdir next to the upper layer (S23overlayfs.sh
-/// mounts workdir=/data/overlay/work). Created on fresh images; on
-/// dumps they already exist (mkdir is a no-op).
-pub const LAYOUT_DIRS: &[&str] = &["/overlay", UPPER_DIR, "/overlay/work"];
-
-/// adbd build (aarch64/glibc; built in docker/adbd, linked against
-/// glibc 2.31 / OpenSSL 1.1 — runs on the stock rootfs). Listens on
-/// USB and TCP:5555 at once (ADBD_TCP_PORT overrides the port).
-pub const OVERLAY_ADBD: &[u8] = include_bytes!("../../../resources/overlay/usr/bin/adbd");
-/// USB gadget flag for firmwares that parse it; harmless elsewhere.
-pub const OVERLAY_USB_CONFIG: &[u8] =
-    include_bytes!("../../../resources/overlay/etc/init.d/.usb_config");
-
-/// One overlay file (the path is inside the userdata partition).
-pub struct OverlayFile {
-    pub path: String,
-    pub data: Vec<u8>,
-    pub mode: u32,
-}
-
-/// The overlay file set: adbd + the gadget flag + the jailbreak marker.
-/// After boot they appear as /usr/bin/adbd, /etc/init.d/.usb_config and
-/// /etc/jailbreak.
-pub fn overlay_files(marker: String) -> Vec<OverlayFile> {
-    vec![
-        OverlayFile {
-            path: format!("{UPPER_DIR}/usr/bin/adbd"),
-            data: OVERLAY_ADBD.to_vec(),
-            mode: 0o755,
-        },
-        OverlayFile {
-            path: format!("{UPPER_DIR}/etc/init.d/.usb_config"),
-            data: OVERLAY_USB_CONFIG.to_vec(),
-            mode: 0o644,
-        },
-        OverlayFile {
-            path: format!("{UPPER_DIR}/etc/jailbreak"),
-            data: marker.into_bytes(),
-            mode: 0o644,
-        },
-    ]
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum UserDataError {
@@ -91,7 +44,7 @@ pub fn build_image(
     fresh: bool,
     part_size: u64,
     files: &[OverlayFile],
-    progress: &dyn Fn(Progress),
+    progress: ProgressFn,
 ) -> Result<(), UserDataError> {
     if out.parent().is_some() {
         std::fs::create_dir_all(out.parent().unwrap())?;
@@ -223,6 +176,7 @@ fn verify(out: &Path, files: &[OverlayFile]) -> Result<(), UserDataError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jb_core::overlay::overlay_files;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     /// lwext4 keeps global state: parallel mounts from different test
@@ -318,7 +272,7 @@ mod tests {
             &|_| {},
         )
         .expect("real adbd");
-        assert_eq!(OVERLAY_ADBD.len(), 126_768);
+        assert_eq!(jb_core::overlay::OVERLAY_ADBD.len(), 126_768);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -2,14 +2,14 @@
 //! indicatif bars.
 
 use indicatif::{ProgressBar, ProgressStyle};
-use jb_core::session::Progress;
+use jb_core::progress::Progress;
 use std::cell::RefCell;
 use std::sync::Mutex;
 
-/// Активная полоса — глобально: логгер (logging.rs) обязан приостанавливать
-/// её отрисовку на время записи строки (предупреждения из доменных крейтов
-/// приходят и посреди передачи). Одновременно активна максимум одна
-/// полоса — сценариев в процессе ровно один.
+/// The active bar is global: the logger (logging.rs) must suspend its
+/// rendering while writing a line (warnings from the domain crates
+/// arrive mid-transfer too). At most one bar is active at a time —
+/// exactly one scenario runs in process.
 static ACTIVE_BAR: Mutex<Option<ProgressBar>> = Mutex::new(None);
 
 pub(crate) fn active_bar() -> Option<ProgressBar> {

@@ -1,14 +1,12 @@
 [package]
 name = "jb-core"
-description = "capsula-jailbreak domain: config, GPT formats, embedded loader, backup/userdata-overlay/flash pipelines"
+description = "capsula-jailbreak shared domain: the platform contract, the scenario skeleton, progress events, the overlay file set, the capture storage, the config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-rockusb = { workspace = true }
-amlogic = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
@@ -16,12 +14,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
-crc32fast = { workspace = true }
 hex = { workspace = true }
-ext4-lwext4 = { workspace = true }
-
-[build-dependencies]
-cc = { workspace = true }
-
-[dev-dependencies]
-# integration tests use the same dependencies as the lib

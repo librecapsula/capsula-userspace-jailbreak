@@ -3,9 +3,9 @@
 //! partition reads -> the directory layout (SHA256SUMS/SUCCESS/tsv) —
 //! no hardware involved.
 
-use jb_core::backup::{backup, CHUNK_SECTORS, GUARD_LBA};
+use jb_rockchip::backup::{backup, CHUNK_SECTORS, GUARD_LBA};
 use jb_core::config::Config;
-use jb_core::gpt;
+use jb_rockchip::gpt;
 use rockusb::loader::{opcode, LoaderSession};
 use rockusb::mock::{MockTransport, Step};
 use std::io::Write as _;
@@ -387,9 +387,9 @@ fn backup_fails_on_cc_mask() {
 /// progress bar must move during a long userdata flash).
 #[test]
 fn write_partition_is_chunked_with_progress() {
-    use jb_core::flash::write_partition_padded;
-    use jb_core::gpt::{Gpt, GptEntry};
-    use jb_core::session::Progress;
+    use jb_rockchip::flash::write_partition_padded;
+    use jb_rockchip::gpt::{Gpt, GptEntry};
+    use jb_core::progress::Progress;
 
     let total = CHUNK_SECTORS as u64 + 3;
     let gpt = Gpt {
@@ -474,7 +474,7 @@ fn write_partition_is_chunked_with_progress() {
 /// store stays verifiable, the run must warn about it.
 #[test]
 fn backup_on_stock_loader_keeps_masked_partitions() {
-    use jb_core::session::Progress;
+    use jb_core::progress::Progress;
 
     const GUARD: u64 = GUARD_LBA as u64;
     let entries = [

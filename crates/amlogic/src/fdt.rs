@@ -373,7 +373,7 @@ mod tests {
         let mut b = Builder::new();
         b.begin("");
         b.prop("compatible", b"x");
-        // нет end() для корня
+        // no end() for the root
         let blob = b.build();
         assert!(parse(&blob).is_err(), "незакрытый корень");
 

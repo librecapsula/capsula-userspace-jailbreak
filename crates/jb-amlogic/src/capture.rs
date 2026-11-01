@@ -1,49 +1,52 @@
-//! Чекпоинт-захват A113X (flasher.sh-модель): стоковый u-boot поднимает
-//! download-окно на каждом включении (identify принимается ~450 мс),
-//! но ПОСЛЕ установления сессии живёт, пока идёт работа, — таймер
-//! простоя (~300–450 мс) сбрасывается identify-keepalive между кусками
-//! (замер 2026-10-31: 160 МиБ одной сессией, 20 × 8 МиБ).
+//! Checkpoint capture for A113X (the flasher.sh model): the stock
+//! u-boot raises the download window at every power-on (identify is
+//! accepted for ~450 ms), but AFTER a session is established it lives
+//! while the work goes on — the idle timer (~300–450 ms) is reset by
+//! an identify-keepalive between chunks (measured 2026-10-31: 160 MiB
+//! in one session, 20 × 8 MiB).
 //!
-//! Каждый [`capture_pass`] снимает сколько успеет за одну сессию и
-//! сохраняет чекпоинт на диск (манифест + `.partial`-файлы — и есть
-//! состояние); смерть сессии возвращает [`Pass::Interrupted`], и
-//! вызывающий просит переподключить плату и продолжает с остановившегося
-//! смещения. Никаких искусственных бюджетов: окно кончается тогда,
-//! когда умирает сессия.
+//! Each [`capture_pass`] captures as much as one session allows and
+//! saves a checkpoint to disk (the manifest + `.partial` files are
+//! the state); a session death returns [`Pass::Interrupted`], and the
+//! caller asks for the board to be reconnected and continues from the
+//! offset it stopped at. No artificial budgets: the window ends when
+//! the session dies.
 //!
-//! Чтение — как у flasher.sh: `nand read <ram> <off> <n>` (shell) +
-//! `upload mem` (стрим) по смещениям логического пространства, что и
-//! делает возможной докачку: `upload store` возобновлению по смещению
-//! не подлежит. Таблица разделов — с устройства: `imgread dtb` читает
-//! DTB активного boot-образа (двойным чтением со сверкой), парсер
-//! (крейт `amlogic::fdt`) выдаёт имена/размеры, сверенные с известной
-//! картой платформы. На Mini нет GPT — DTB и есть таблица разделов.
+//! Reads follow flasher.sh: `nand read <ram> <off> <n>` (shell) +
+//! `upload mem` (stream) at offsets of the logical space, which is
+//! what makes resumption possible: `upload store` cannot be resumed
+//! at an offset. The partition table comes from the device: `imgread
+//! dtb` reads the DTB of the active boot image (a double read with a
+//! comparison), and the parser (the `amlogic::fdt` crate) yields
+//! names/sizes checked against the known platform map. The Mini has
+//! no GPT — the DTB is the partition table.
 //!
-//! Манифест (`manifest.json`, schema 2) аутентифицирует сохранённые
-//! файлы и хранит снятую с устройства разметку; формат каталога —
-//! `backup/amlogic-<время>-<pid>-<n>/`, у каждого запуска свой каталог.
+//! The manifest (`manifest.json`, schema 2) authenticates the stored
+//! files and keeps the layout taken from the device; the directory
+//! format is `backup/amlogic-<time>-<pid>-<n>/`, every run gets its
+//! own directory.
 
-use crate::backup_store::{file_sha256, safe_capture_name, CaptureDirectory};
-use crate::session::{Progress, ProgressFn};
 use amlogic::{fdt, nand, AmlogicSession, Transport};
 use anyhow::{bail, ensure, Context};
+use jb_core::backup_store::{file_sha256, safe_capture_name, CaptureDirectory};
+use jb_core::progress::{Progress, ProgressFn};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Имена обычных разделов в порядке логической разметки (DTB
-/// nand_partition, порядок вендора; bootloader и AML-reserved идут
-/// перед ними и в DTB не входят).
+/// Names of the normal partitions in logical layout order (the DTB
+/// nand_partition, vendor order; bootloader and the AML-reserved
+/// ranges come before them and are not part of the DTB).
 pub const NORMAL_PARTITIONS: &[&str] = &[
     "tpl", "misc", "boot_a", "boot_b", "system_a", "system_b", "data",
 ];
 
-/// Размер fip/bootloader на известной платформе (платформенный гейт).
+/// Size of fip/bootloader on the known platform (the platform gate).
 pub const FIP_SIZE: u32 = 0x20_0000;
-/// Начало tpl на известной платформе: bootloader (2 МиБ) + диапазон
-/// AML-reserved областей (6 МиБ).
+/// Start of tpl on the known platform: bootloader (2 MiB) + the
+/// AML-reserved ranges (6 MiB).
 pub const PLATFORM_TPL_START: u32 = 0x80_0000;
-/// Размер tpl, когда DTB задаёт его нулём («до следующего»).
+/// Size of tpl when the DTB sets it to zero ("until the next one").
 const TPL_SIZE: u32 = 0x80_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,13 +58,13 @@ pub enum Status {
     Warnings,
 }
 
-/// Итог одного прохода окна.
+/// The outcome of one window pass.
 #[derive(Debug)]
 pub enum Pass {
-    /// Всё снято, манифест сфинализирован и проверен.
+    /// Everything captured, the manifest finalized and verified.
     Done(BackupReport),
-    /// Сессия умерла (окно кончилось); чекпоинт сохранён —
-    /// переподключите плату и вызовите [`capture_pass`] снова.
+    /// The session died (the window ended); the checkpoint is saved —
+    /// reconnect the board and call [`capture_pass`] again.
     Interrupted(String),
 }
 
@@ -82,7 +85,8 @@ struct FileRecord {
     sha256: String,
 }
 
-/// Раздел, снятый с устройства (device-истина на момент захвата).
+/// A partition taken from the device (the device truth at capture
+/// time).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionRecord {
@@ -100,10 +104,10 @@ struct Manifest {
     page_size: u32,
     oob_size: u32,
     device_read_passes: u32,
-    /// Снятая с устройства разметка (после DTB-шага).
+    /// The layout taken from the device (after the DTB step).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     layout: Vec<PartitionRecord>,
-    /// Зарезервированные AML-области (адреса фиксированы платформой).
+    /// Reserved AML areas (addresses fixed by the platform).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     reserved: Vec<PartitionRecord>,
     status: Status,
@@ -118,12 +122,12 @@ struct Layout {
     nand_size: u32,
 }
 
-/// Вывести карту разделов из DTB устройства: fip_size + nand_partition
-/// (строгий парсер крейта amlogic), кумулятивные смещения по порядку
-/// вендора; data добивает NAND. `tpl_start` — конец диапазона
-/// bootloader+reserved (платформа: [`PLATFORM_TPL_START`]). Это
-/// device-истина — без сравнения с известной картой (платформенный
-/// гейт — [`ensure_platform`]).
+/// Derive the partition map from the device DTB: fip_size +
+/// nand_partition (the strict parser of the amlogic crate), cumulative
+/// offsets in vendor order; data fills up the NAND. `tpl_start` is the
+/// end of the bootloader+reserved range (platform:
+/// [`PLATFORM_TPL_START`]). This is the device truth — no comparison
+/// against the known map (the platform gate is [`ensure_platform`]).
 fn layout_from_dtb(
     blob: &[u8],
     tpl_start: u32,
@@ -145,9 +149,12 @@ fn layout_from_dtb(
             .is_some_and(|c| c.windows(12).any(|w| w == b"aml_mtd_nand"))
     });
     ensure!(nodes.len() == 1, "в DTB не ровно один aml_mtd_nand");
-    let fip = fdt::be_u32(nodes[0].prop("fip_size").unwrap_or(&[]))
-        .context("в DTB нет fip_size")?;
-    ensure!(fip > 0 && fip <= tpl_start, "некорректный fip_size {fip:#x} в DTB");
+    let fip =
+        fdt::be_u32(nodes[0].prop("fip_size").unwrap_or(&[])).context("в DTB нет fip_size")?;
+    ensure!(
+        fip > 0 && fip <= tpl_start,
+        "некорректный fip_size {fip:#x} в DTB"
+    );
     let parts = nodes[0]
         .child("nand_partition")
         .context("в DTB нет nand_partition")?;
@@ -157,7 +164,8 @@ fn layout_from_dtb(
         parts.children.len(),
         NORMAL_PARTITIONS.len()
     );
-    // bootloader и reserved-диапазон вне DTB; разделы идут с tpl_start
+    // bootloader and the reserved range are outside the DTB;
+    // partitions start at tpl_start
     let mut off = tpl_start;
     let mut out = vec![("bootloader".to_string(), 0, fip)];
     for (i, name) in NORMAL_PARTITIONS.iter().enumerate() {
@@ -177,7 +185,7 @@ fn layout_from_dtb(
         let mut size = raw as u32;
         if name == &"tpl" {
             if size == 0 {
-                // «до следующего»: на платформе это 8 МиБ (flasher VPART)
+                // "until the next one": 8 MiB on this platform (flasher VPART)
                 size = TPL_SIZE;
             }
         } else if name == &"data" {
@@ -197,9 +205,9 @@ fn layout_from_dtb(
     Ok(out)
 }
 
-/// Платформенный гейт: карта с устройства обязана совпасть с известной
-/// картой Capsula Mini — иначе смещения чтения ненадёжны, и лучше
-/// отказаться, чем молча снять мусор.
+/// The platform gate: the map from the device must match the known
+/// Capsula Mini map — otherwise the read offsets are unreliable, and
+/// refusing is better than silently capturing garbage.
 fn ensure_platform(partitions: &[(String, u32, u32)]) -> anyhow::Result<()> {
     let known: Vec<(String, u32, u32)> = amlogic::PARTITIONS
         .iter()
@@ -214,7 +222,7 @@ fn ensure_platform(partitions: &[(String, u32, u32)]) -> anyhow::Result<()> {
 }
 
 impl Layout {
-    /// Разметка с устройства + платформенный гейт.
+    /// The layout from the device + the platform gate.
     fn from_device_dtb(blob: &[u8]) -> anyhow::Result<Layout> {
         let partitions = layout_from_dtb(blob, PLATFORM_TPL_START, nand::NAND_SIZE)?;
         ensure_platform(&partitions)?;
@@ -258,20 +266,21 @@ impl Layout {
     }
 }
 
-/// Устройство в рамках одной сессии. Все методы короткие; ошибки
-/// транспорта — нормальный конец окна, их перехватывает drive.
+/// The device within one session. All methods are short; transport
+/// errors are a normal window end, intercepted by drive.
 trait Device {
     fn partition_size(&mut self, name: &str, physical: usize) -> anyhow::Result<usize>;
     fn env(&mut self) -> anyhow::Result<Vec<u8>>;
-    /// DTB активного boot-образа (таблица разделов устройства).
+    /// The DTB of the active boot image (the device partition table).
     fn dtb(&mut self, slot: &str) -> anyhow::Result<Vec<u8>>;
-    /// Разметка из DTB (платформенный гейт — у реального устройства).
+    /// The layout from the DTB (the platform gate applies on the real
+    /// device).
     fn layout(&mut self, blob: &[u8]) -> anyhow::Result<Layout>;
-    /// Прочитать диапазон NAND в `out` начиная со смещения `off`
-    /// (главное пространство). `len` — в байтах ФАЙЛА: для raw=false
-    /// это главные байты, для raw=true — байты вместе с OOB
-    /// (`страница+OOB`-кратно); `off` всегда в главных байтах.
-    /// Возвращает дописанные байты файла.
+    /// Read a NAND range into `out` starting at offset `off` (main
+    /// space). `len` is in FILE bytes: for raw=false these are main
+    /// bytes, for raw=true bytes including OOB (a multiple of
+    /// page+OOB); `off` is always in main bytes. Returns the file
+    /// bytes appended.
     fn read_range(
         &mut self,
         off: u32,
@@ -288,7 +297,7 @@ impl<T: Transport> Device for AmlogicSession<T> {
     }
 
     fn env(&mut self) -> anyhow::Result<Vec<u8>> {
-        super::capture_env_raw(self)
+        crate::env::capture_env_raw(self)
     }
 
     fn dtb(&mut self, slot: &str) -> anyhow::Result<Vec<u8>> {
@@ -307,30 +316,30 @@ impl<T: Transport> Device for AmlogicSession<T> {
         out: &mut dyn Write,
         progress: &dyn Fn(usize),
     ) -> anyhow::Result<usize> {
-        // длина пришла в файловых байтах; устройство читает главными
+        // the length arrived in file bytes; the device reads main bytes
         let file_page: u64 = if raw {
             nand::raw_bytes(nand::PAGE_SIZE)? as u64
         } else {
             nand::PAGE_SIZE as u64
         };
-        ensure!(len.is_multiple_of(file_page), "некратный странице кусок чтения");
+        ensure!(
+            len.is_multiple_of(file_page),
+            "некратный странице кусок чтения"
+        );
         let main = if raw {
             (len / file_page * nand::PAGE_SIZE as u64) as u32
         } else {
             len as u32
         };
-        let written = self
-            .read_nand_range(off, main, raw, out, &|n| {
-                progress(n)
-            })?;
+        let written = self.read_nand_range(off, main, raw, out, &|n| progress(n))?;
         Ok(written)
     }
 }
 
-/// Идентичность колонки: `deviceid` из окружения u-boot (ключевое
-/// хранилище платы — device-уникален и стабилен), аналог серийника
-/// rockchip-колонок и ключ каталога бэкапа; в bootargs он же светится
-/// как `androidboot.deviceid`.
+/// The column's identity: the `deviceid` from the u-boot environment
+/// (the board's key store — device-unique and stable), the analog of
+/// the rockchip columns' serial and the key of the backup directory;
+/// in bootargs it also shows up as `androidboot.deviceid`.
 pub fn device_id(env_raw: &[u8]) -> anyhow::Result<String> {
     let text = environment_text(env_raw)?;
     let raw = text
@@ -362,25 +371,29 @@ fn fresh_manifest() -> Manifest {
     }
 }
 
-/// Результат открытия каталога захвата.
+/// The result of opening a capture directory.
 pub enum OpenedCapture {
-    /// Захват не завершён — гоняй [`capture_pass`] по этому каталогу
-    /// (новый или продолжаемый с чекпоинта прошлых запусков).
+    /// The capture is not finished — run [`capture_pass`] on this
+    /// directory (new, or resumable from the checkpoint of previous
+    /// runs).
     Run(PathBuf),
-    /// Полный проверенный захват уже лежит в каталоге — снимать нечего.
+    /// A full verified capture is already in the directory — nothing
+    /// left to capture.
     Done(BackupReport),
 }
 
-/// Открыть (или создать) каталог бэкапа по серийнику — как у rockchip:
-/// `backup/<deviceid>/`. Окружение читается с устройства ровно один раз
-/// за запуск (вызывающий передаёт его сюда) и сразу записывается в
-/// каталог, так что `drive()` этот шаг пропускает. Поведение при
-/// существующем каталоге:
-/// - полный и верифицированный захват — [`OpenedCapture::Done`];
-/// - незавершённый (`Running`) — продолжается с чекпоинта; окружение в
-///   каталоге сверяется с deviceid свежепрочитанного (чужой каталог —
-///   отказ, продолжать чужой захват нельзя);
-/// - `Failed` или нечитаемый манифест — отказ, разбираться вручную.
+/// Open (or create) the backup directory by serial — as with rockchip:
+/// `backup/<deviceid>/`. The environment is read from the device
+/// exactly once per run (the caller passes it here) and is written
+/// into the directory right away, so `drive()` skips that step.
+/// Behavior with an existing directory:
+/// - a full and verified capture — [`OpenedCapture::Done`];
+/// - unfinished (`Running`) — continues from the checkpoint; the
+///   environment in the directory is checked against the deviceid of
+///   the freshly read one (someone else's directory is refused —
+///   continuing someone else's capture is not allowed);
+/// - `Failed` or an unreadable manifest — refusal, sort it out
+///   manually.
 pub fn open_or_start(parent: &Path, env_raw: &[u8]) -> anyhow::Result<OpenedCapture> {
     let id = device_id(env_raw)?;
     let dir_path = parent.join(&id);
@@ -393,7 +406,7 @@ pub fn open_or_start(parent: &Path, env_raw: &[u8]) -> anyhow::Result<OpenedCapt
         save_manifest(&dir, &m)?;
         return Ok(OpenedCapture::Run(dir.path().into()));
     }
-    // каталог уже есть — разобрать его состояние
+    // the directory already exists — parse its state
     let mp = dir_path.join("manifest.json");
     ensure!(
         mp.is_file(),
@@ -418,8 +431,9 @@ pub fn open_or_start(parent: &Path, env_raw: &[u8]) -> anyhow::Result<OpenedCapt
             m.error.as_deref().unwrap_or("без описания")
         ),
         Status::Running => {
-            // чужой каталог не продолжаем: сверяем deviceid сохранённого
-            // окружения с прочитанным только что
+            // someone else's directory is not continued: the deviceid
+            // of the stored environment is checked against the one
+            // just read
             match std::fs::read(dir_path.join("env-export.bin")) {
                 Ok(raw) => {
                     let recorded = device_id(&raw)?;
@@ -431,8 +445,9 @@ pub fn open_or_start(parent: &Path, env_raw: &[u8]) -> anyhow::Result<OpenedCapt
                         recorded
                     );
                 }
-                // старый незавершённый захват без окружения — дописываем
-                // свежее (deviceid уже совпал по имени каталога)
+                // an old unfinished capture without an environment —
+                // append the fresh one (the deviceid already matched
+                // via the directory name)
                 Err(_) => {
                     let dir = CaptureDirectory::open(&dir_path)?;
                     let mut m = m;
@@ -447,10 +462,10 @@ pub fn open_or_start(parent: &Path, env_raw: &[u8]) -> anyhow::Result<OpenedCapt
     }
 }
 
-/// Один проход окна: продолжить захват из чекпоинта в `dir_path`.
-/// Проход длится до полного захвата или до смерти сессии; по их
-/// исчерпанию возвращается [`Pass::Interrupted`] с сохранённым
-/// чекпоинтом.
+/// One window pass: continue the capture from the checkpoint in
+/// `dir_path`. The pass lasts until the capture is complete or the
+/// session dies; when the session dies, [`Pass::Interrupted`] is
+/// returned with the checkpoint saved.
 pub fn capture_pass<T: Transport>(
     session: &mut AmlogicSession<T>,
     dir_path: &Path,
@@ -501,8 +516,8 @@ pub fn capture_pass<T: Transport>(
     }
 }
 
-/// Ошибки прохода: конец окна (норма, чекпоинт сохраняется) против
-/// фатальной (диск/манифест — статус Failed).
+/// Pass errors: a window end (normal, the checkpoint is saved) versus
+/// a fatal one (disk/manifest — status Failed).
 enum DriveError {
     Window(String),
     Fatal(anyhow::Error),
@@ -515,9 +530,7 @@ impl DriveError {
 
 fn find_record<'a>(m: &'a Manifest, base: &str) -> Option<&'a FileRecord> {
     let partial = format!("{base}.partial");
-    m.files
-        .iter()
-        .find(|f| f.name == base || f.name == partial)
+    m.files.iter().find(|f| f.name == base || f.name == partial)
 }
 
 fn partial_len(dir: &CaptureDirectory, partial: &str) -> u64 {
@@ -526,9 +539,10 @@ fn partial_len(dir: &CaptureDirectory, partial: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Чекпоинт-запись по факту на диске: хеш + фактический размер;
-/// полный файл публикуется (`.partial` → итоговое имя). Идемпотентна:
-/// уже опубликованный файл переотмечается без переименования.
+/// Checkpoint recording based on what is on disk: hash + actual size;
+/// a complete file is published (`.partial` → final name).
+/// Idempotent: an already published file is re-recorded without
+/// renaming.
 fn record(
     dir: &CaptureDirectory,
     m: &mut Manifest,
@@ -600,9 +614,9 @@ fn environment_text(raw: &[u8]) -> anyhow::Result<&str> {
     Ok(text)
 }
 
-/// Слот активного boot-образа из текста окружения (boot_part); без
-/// окружения — boot_a/boot_b по порядку, первый, с которого `imgread
-/// dtb` отвечает.
+/// The slot of the active boot image from the environment text
+/// (boot_part); without an environment — boot_a/boot_b in order, the
+/// first one whose `imgread dtb` answers.
 fn dtb_slots(env_text: Option<&str>) -> Vec<&'static str> {
     let mut slots: Vec<&'static str> = Vec::new();
     if let Some(text) = env_text {
@@ -626,7 +640,7 @@ fn dtb_slots(env_text: Option<&str>) -> Vec<&'static str> {
     slots
 }
 
-/// Описание одного элемента захвата (раздел, reserved, сырой дамп).
+/// Description of one capture item (a partition, reserved, raw dump).
 struct Item<'a> {
     base: &'a str,
     label: &'a str,
@@ -636,8 +650,8 @@ struct Item<'a> {
     physical: Option<u64>,
 }
 
-/// Один элемент захвата: докачать от чекпоинта до конца или до смерти
-/// сессии.
+/// One capture item: continue from the checkpoint until the end or
+/// until the session dies.
 fn capture_item(
     dev: &mut impl Device,
     dir: &CaptureDirectory,
@@ -653,12 +667,11 @@ fn capture_item(
         raw,
         physical,
     } = item;
-    // Уже готово (включая «полный, но не опубликованный» с прошлого
-    // окна) — только публикуем.
+    // Already complete (including "complete but not published" from
+    // the previous window) — just publish.
     if let Some(r) = find_record(m, base) {
         if r.actual == r.expected {
-            record(dir, m, base, expected, physical)
-                .map_err(DriveError::Fatal)?;
+            record(dir, m, base, expected, physical).map_err(DriveError::Fatal)?;
             return Ok(());
         }
     }
@@ -666,7 +679,7 @@ fn capture_item(
     let cur = partial_len(dir, &partial);
     if find_record(m, base).is_none() {
         if cur == 0 {
-            // create_new: первый кусок этого элемента
+            // create_new: the first chunk of this item
             dir.create_file(&partial).map_err(DriveError::fatal)?;
         }
         record(dir, m, base, expected, physical).map_err(DriveError::Fatal)?;
@@ -675,7 +688,7 @@ fn capture_item(
         name: label.into(),
         bytes: expected,
     });
-    // смещение устройства в главных байтах; длина — в файловых байтах
+    // the device offset in main bytes; the length in file bytes
     let raw_page = nand::raw_bytes(nand::PAGE_SIZE).map_err(DriveError::fatal)? as u64;
     let dev_off = if raw {
         off + (cur / raw_page * nand::PAGE_SIZE as u64) as u32
@@ -687,20 +700,14 @@ fn capture_item(
             .append(true)
             .open(dir.path().join(&partial))
             .map_err(|e| DriveError::Fatal(e.into()))?;
-        let got = dev.read_range(
-            dev_off,
-            expected - cur,
-            raw,
-            &mut f,
-            &|n| {
-                progress(Progress::TransferProgress {
-                    name: label.into(),
-                    done: cur + n as u64,
-                    total: expected,
-                })
-            },
-        );
-        // принятый префикс синхронизируется даже при ошибке USB
+        let got = dev.read_range(dev_off, expected - cur, raw, &mut f, &|n| {
+            progress(Progress::TransferProgress {
+                name: label.into(),
+                done: cur + n as u64,
+                total: expected,
+            })
+        });
+        // the received prefix is synced even on a USB error
         let synced = f.sync_all();
         match (got, synced) {
             (Ok(_), Ok(())) => Ok(()),
@@ -712,19 +719,18 @@ fn capture_item(
     })();
     match read {
         Ok(()) => {}
-        // конец окна: чекпоинт префикса всё равно фиксируется
+        // window end: the prefix checkpoint is recorded anyway
         Err(e @ DriveError::Window(_)) => {
             let _ = record(dir, m, base, expected, physical);
             return Err(e);
         }
         Err(e) => return Err(e),
     }
-    // чекпоинт по факту на диске: и после успеха, и после смерти окна
+    // checkpoint based on what is on disk: after success and after a
+    // window death alike
     let on_disk = partial_len(dir, &partial);
     record(dir, m, base, expected, physical).map_err(DriveError::Fatal)?;
-    progress(Progress::TransferDone {
-        name: label.into(),
-    });
+    progress(Progress::TransferDone { name: label.into() });
     if on_disk < expected {
         Err(DriveError::Window(format!(
             "{label}: снято {on_disk:#x} из {expected:#x} — сессия умерла"
@@ -740,30 +746,38 @@ fn drive(
     m: &mut Manifest,
     progress: ProgressFn,
 ) -> Result<(), DriveError> {
-    // 1. Окружение — раз на захват, до разделов (из него берётся слот).
+    // 1. Environment — once per capture, before the partitions (the
+    // slot is taken from it).
     let env_text = if find_record(m, "env.txt").is_none() {
         progress(Progress::Step("Amlogic: съём окружения u-boot".into()));
-        let env = dev.env().map_err(|e| {
-            DriveError::Window(format!("съём окружения не удался (окно?): {e:#}"))
-        })?;
+        let env = dev
+            .env()
+            .map_err(|e| DriveError::Window(format!("съём окружения не удался (окно?): {e:#}")))?;
         if env.len() != amlogic::ENV_SIZE {
-            return Err(DriveError::fatal(anyhow::anyhow!("короткий снимок окружения")));
+            return Err(DriveError::fatal(anyhow::anyhow!(
+                "короткий снимок окружения"
+            )));
         }
         bytes(dir, m, "env-export.bin", &env).map_err(DriveError::Fatal)?;
-        let text = environment_text(&env).map_err(DriveError::Fatal)?.to_string();
+        let text = environment_text(&env)
+            .map_err(DriveError::Fatal)?
+            .to_string();
         bytes(dir, m, "env.txt", text.as_bytes()).map_err(DriveError::Fatal)?;
         Some(text)
     } else {
         std::fs::read_to_string(dir.path().join("env.txt")).ok()
     };
 
-    // 2. Разметка с устройства: DTB активного boot-образа (кэш в
-    //    манифесте — чекпоинт), платформенный гейт против известной
-    //    карты. На Mini нет GPT: DTB — единственная таблица разделов.
+    // 2. The layout from the device: the DTB of the active boot image
+    //    (cached in the manifest — the checkpoint), the platform gate
+    //    against the known map. The Mini has no GPT: the DTB is the
+    //    only partition table.
     let layout = if !m.layout.is_empty() {
         Layout::from_records(&m.layout, &m.reserved, m.nand_size)
     } else {
-        progress(Progress::Step("Amlogic: чтение таблицы разделов (DTB)".into()));
+        progress(Progress::Step(
+            "Amlogic: чтение таблицы разделов (DTB)".into(),
+        ));
         let mut blob = None;
         let mut last = None;
         for slot in dtb_slots(env_text.as_deref()) {
@@ -777,9 +791,7 @@ fn drive(
             }
         }
         let (slot, blob) = blob.ok_or_else(|| {
-            DriveError::Window(format!(
-                "чтение DTB не удалось (окно?): {last:?}"
-            ))
+            DriveError::Window(format!("чтение DTB не удалось (окно?): {last:?}"))
         })?;
         let layout = dev.layout(&blob).map_err(DriveError::fatal)?;
         bytes(dir, m, "device.dtb", &blob).map_err(DriveError::Fatal)?;
@@ -802,8 +814,8 @@ fn drive(
         layout
     };
 
-    // 3. Разделы — по логической ёмкости (store size), докачка по
-    //    смещениям `nand read` (бед-блоки u-boot обходит сам).
+    // 3. Partitions — by logical capacity (store size), resuming at
+    //    `nand read` offsets (u-boot skips bad blocks itself).
     for (name, off, size) in &layout.partitions {
         let base = format!("{name}.bin");
         let expected = match find_record(m, &base) {
@@ -842,7 +854,7 @@ fn drive(
         )?;
     }
 
-    // 4. Зарезервированные области — по адресам (device-уникальны).
+    // 4. Reserved areas — by addresses (device-unique).
     for (name, off, size) in &layout.reserved {
         let base = format!("reserved-{name}.bin");
         progress(Progress::Step(format!(
@@ -864,7 +876,8 @@ fn drive(
         )?;
     }
 
-    // 5. Полный сырой дамп с OOB — постранично, докачка по страницам.
+    // 5. The full raw dump with OOB — page by page, resuming at page
+    //    boundaries.
     let expected_raw = nand::raw_bytes(layout.nand_size).map_err(DriveError::fatal)? as u64;
     progress(Progress::Step("Amlogic: полный сырой дамп NAND".into()));
     capture_item(
@@ -884,9 +897,9 @@ fn drive(
     Ok(())
 }
 
-/// Проверить записанный инвентарь, геометрию, размеры и контрольные
-/// суммы на диске — без обращения к USB. Разметка из манифеста
-/// перепроверяется по сохранённому device.dtb.
+/// Verify the recorded inventory, geometry, sizes and checksums on
+/// disk — without touching USB. The layout from the manifest is
+/// re-checked against the stored device.dtb.
 pub fn verify(path: &Path) -> anyhow::Result<BackupReport> {
     ensure!(
         std::fs::symlink_metadata(path)?.file_type().is_dir(),
@@ -941,8 +954,8 @@ fn validate(path: &Path, m: &Manifest) -> anyhow::Result<()> {
     let layout = Layout::from_records(&m.layout, &m.reserved, m.nand_size);
     let mut expected = std::collections::BTreeMap::new();
     expected.insert("env-export.bin".into(), (amlogic::ENV_SIZE as u64, false));
-    // Текстовый экспорт выводится локально и ограничен бинарным
-    // окружением.
+    // The text export is produced locally and is bounded by the
+    // binary environment.
     expected.insert("env.txt".into(), (0, false));
     expected.insert("device.dtb".into(), (blob.len() as u64, false));
     for (name, _, size) in &layout.partitions {
@@ -1024,15 +1037,16 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// Тестовая геометрия: NAND 4096, bootloader 0..8, reserved-диапазон
-    /// 8..16 (keys 8..12 внутри), tpl_start=16, разделы по 8, data —
-    /// остаток. Структура узлов DTB — как у реальной платформы.
+    /// Test geometry: NAND 4096, bootloader 0..8, the reserved range
+    /// 8..16 (keys 8..12 inside), tpl_start=16, partitions of 8 each,
+    /// data — the remainder. The DTB node structure is like the real
+    /// platform's.
     const NAND: u32 = 4096;
     const TPL_START: u32 = 16;
     const FIP: u32 = 8;
     const REGIONS: &[(&str, u32, u32)] = &[("keys", 8, 4)];
 
-    /// FDT-блоб с nand_partition тестовой геометрии.
+    /// An FDT blob with the nand_partition of the test geometry.
     fn synthetic_dtb() -> Vec<u8> {
         struct B {
             strings: Vec<u8>,
@@ -1142,8 +1156,8 @@ mod tests {
         fail: bool,
         environment: Option<Vec<u8>>,
         readable: Option<usize>,
-        /// Сколько байт ФАЙЛА отдаёт read_range за один вызов
-        /// (короткий ответ = сессия умерла посреди элемента).
+        /// How many FILE bytes read_range returns per call (a short
+        /// answer = the session died in the middle of an item).
         chunk: usize,
     }
     impl Fake {
@@ -1175,7 +1189,7 @@ mod tests {
             Ok(synthetic_dtb())
         }
         fn layout(&mut self, blob: &[u8]) -> anyhow::Result<Layout> {
-            // тестовая геометрия без платформенного гейта
+            // test geometry without the platform gate
             Ok(Layout {
                 partitions: layout_from_dtb(blob, TPL_START, NAND)?,
                 reserved: REGIONS
@@ -1231,8 +1245,9 @@ mod tests {
     fn run_pass(dev: &mut impl Device, dir: &Path) -> anyhow::Result<Pass> {
         capture_pass_inner(dev, dir, &|_| {})
     }
-    /// Тестовый вход: как capture_pass, но на Fake-устройстве и с
-    /// тестовой геометрией (платформенный гейт вне тестовой разметки).
+    /// The test entry point: like capture_pass, but on the Fake device
+    /// and with the test geometry (the platform gate is outside the
+    /// test layout).
     fn capture_pass_inner(
         dev: &mut impl Device,
         dir_path: &Path,
@@ -1281,7 +1296,9 @@ mod tests {
         let dir = begin(&parent);
         let mut dev = Fake::new();
         let report = run_pass(&mut dev, &dir).unwrap();
-        let Pass::Done(report) = report else { panic!("не Done") };
+        let Pass::Done(report) = report else {
+            panic!("не Done")
+        };
         assert_eq!(report.status, Status::Complete);
         assert_eq!(
             *dev.calls.borrow(),
@@ -1312,9 +1329,11 @@ mod tests {
             Ok(r) => assert_eq!(r.status, Status::Complete),
             Err(e) => {
                 let mtxt = std::fs::read_to_string(report.path.join("manifest.json")).unwrap();
-                panic!("verify failed: {e:#}
+                panic!(
+                    "verify failed: {e:#}
 ---
-{mtxt}");
+{mtxt}"
+                );
             }
         }
         std::fs::write(report.path.join("bootloader.bin"), b"corrupt!").unwrap();
@@ -1326,7 +1345,7 @@ mod tests {
     fn interrupted_pass_keeps_prefix_and_resume_completes() {
         let parent = parent();
         let dir = begin(&parent);
-        // Окно 1: чтение раздела обрывается на 3 байтах.
+        // Window 1: the partition read is cut off at 3 bytes.
         let mut dev = Fake::new();
         dev.chunk = 3;
         match run_pass(&mut dev, &dir).unwrap() {
@@ -1343,7 +1362,8 @@ mod tests {
         let m: Manifest =
             serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(m.status, Status::Running);
-        // Окно 2: здоровая сессия докачивает с чекпоинта.
+        // Window 2: a healthy session completes the capture from the
+        // checkpoint.
         let mut dev = Fake::new();
         match run_pass(&mut dev, &dir).unwrap() {
             Pass::Done(report) => {
@@ -1369,7 +1389,8 @@ mod tests {
             Pass::Interrupted(reason) => assert!(reason.contains("USB"), "{reason}"),
             Pass::Done(_) => panic!("ошибка транспорта не должна давать Done"),
         }
-        // env и dtb успели (они до разделов), раздел не публикуется
+        // env and dtb made it (they come before the partitions), the
+        // partition is not published
         assert!(dir.join("env.txt").is_file());
         assert!(dir.join("device.dtb").is_file());
         assert!(dir.join("bootloader.bin.partial").is_file());
@@ -1419,8 +1440,7 @@ mod tests {
             dev.environment = Some(raw.clone());
             assert!(run_pass(&mut dev, &dir).is_err());
             let m: Manifest =
-                serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap())
-                    .unwrap();
+                serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
             assert_eq!(m.status, Status::Failed);
             assert_eq!(std::fs::read(dir.join("env-export.bin")).unwrap(), raw);
             assert!(!dir.join("env.txt").exists());
@@ -1491,18 +1511,12 @@ mod tests {
         std::fs::remove_dir_all(parent.path()).unwrap();
     }
 
-    /// Разметка из DTB реальной платформы: кумулятивные смещения,
-    /// tpl/data по нулю, платформенный гейт.
+    /// The layout from the real platform's DTB: cumulative offsets,
+    /// tpl/data at zero, the platform gate.
     #[test]
     fn mini_layout_derives_from_a_mini_dtb() {
         let sizes: [u32; 7] = [
-            0,
-            0x20_0000,
-            0x100_0000,
-            0x100_0000,
-            0x400_0000,
-            0x400_0000,
-            0,
+            0, 0x20_0000, 0x100_0000, 0x100_0000, 0x400_0000, 0x400_0000, 0,
         ];
         let mut b = MiniBuilder::new();
         b.begin("");
@@ -1531,14 +1545,15 @@ mod tests {
         let layout = Layout::from_device_dtb(&blob).unwrap();
         assert_eq!(layout.to_records().len(), 8);
 
-        // чужой DTB платформенный гейт отвергает
+        // the platform gate rejects someone else's DTB
         let mut wrong = blob.clone();
         let n = wrong.len() - 1;
         wrong[n] ^= 0xff;
         assert!(Layout::from_device_dtb(&wrong).is_err());
     }
 
-    /// Слот DTB: boot_part из окружения первый, потом fallback.
+    /// The DTB slot: boot_part from the environment first, then the
+    /// fallback.
     #[test]
     fn dtb_slots_prefer_env_boot_part() {
         assert_eq!(
@@ -1551,7 +1566,7 @@ mod tests {
         let _ = (test_layout(), raw_expected());
     }
 
-    /// Прямой доступ к сборщику FDT для теста разметки платформы.
+    /// Direct access to the FDT builder for the platform-layout test.
     struct MiniBuilder {
         strings: Vec<u8>,
         st: Vec<u8>,
@@ -1599,9 +1614,8 @@ mod tests {
             let struct_off = header + 16;
             let total = struct_off + self.st.len() + self.strings.len();
             let mut b = vec![0u8; total];
-            let put = |b: &mut Vec<u8>, n: usize, v: u32| {
-                b[n..n + 4].copy_from_slice(&v.to_be_bytes())
-            };
+            let put =
+                |b: &mut Vec<u8>, n: usize, v: u32| b[n..n + 4].copy_from_slice(&v.to_be_bytes());
             put(&mut b, 0, 0xd00d_feed);
             put(&mut b, 4, total as u32);
             put(&mut b, 8, struct_off as u32);
@@ -1617,7 +1631,7 @@ mod tests {
         }
     }
 
-    // --- identity: бэкап по серийнику (deviceid) ---
+    // --- identity: backup by serial (deviceid) ---
 
     fn env_bytes(text: &str) -> Vec<u8> {
         let mut data = vec![0u8; amlogic::ENV_SIZE];
@@ -1639,7 +1653,10 @@ mod tests {
             device_id(&test_env("deadbeef01234567")).unwrap(),
             "DEADBEEF01234567"
         );
-        assert!(device_id(&env_bytes("bootcmd=x\n")).is_err(), "нет deviceid");
+        assert!(
+            device_id(&env_bytes("bootcmd=x\n")).is_err(),
+            "нет deviceid"
+        );
         assert!(device_id(&test_env("short")).is_err(), "слишком короткий");
         assert!(device_id(&test_env("0394A722CE66891!")).is_err(), "не hex");
         assert!(
@@ -1662,7 +1679,7 @@ mod tests {
         assert_eq!(dir.file_name().unwrap(), "0394A722CE668914");
         assert!(dir.join("env.txt").is_file());
         assert!(dir.join("env-export.bin").is_file());
-        // окружение уже записано — drive его не снимает
+        // the environment is already recorded — drive does not capture it
         let mut dev = Fake::new();
         match run_pass(&mut dev, &dir).unwrap() {
             Pass::Done(report) => {
@@ -1671,7 +1688,7 @@ mod tests {
             }
             Pass::Interrupted(r) => panic!("не прошло: {r}"),
         }
-        // повторное открытие завершённого каталога — Done без захвата
+        // reopening a finished directory — Done without capturing
         let mut dev = Fake::new();
         match open_or_start(parent.path(), &test_env("0394A722CE668914")).unwrap() {
             OpenedCapture::Done(report) => {
@@ -1692,8 +1709,11 @@ mod tests {
         };
         let mut dev = Fake::new();
         dev.chunk = 3;
-        assert!(matches!(run_pass(&mut dev, &dir).unwrap(), Pass::Interrupted(_)));
-        // «новый запуск»: тот же каталог продолжается с чекпоинта
+        assert!(matches!(
+            run_pass(&mut dev, &dir).unwrap(),
+            Pass::Interrupted(_)
+        ));
+        // "a new run": the same directory continues from the checkpoint
         let dir2 = match open_or_start(parent.path(), &test_env("0394A722CE668914")).unwrap() {
             OpenedCapture::Run(p) => p,
             OpenedCapture::Done(_) => panic!("незавершённый каталог не Run"),
@@ -1715,22 +1735,26 @@ mod tests {
             OpenedCapture::Run(p) => p,
             OpenedCapture::Done(_) => panic!("новый каталог не Done"),
         };
-        // в каталоге чужое окружение (переименовали/подменили)
-        std::fs::write(dir.join("env-export.bin"), test_env("FFFFFFFFFFFFFFFF").len().to_string().as_bytes()).ok();
+        // the directory holds someone else's environment (renamed/swapped)
+        std::fs::write(
+            dir.join("env-export.bin"),
+            test_env("FFFFFFFFFFFFFFFF").len().to_string().as_bytes(),
+        )
+        .ok();
         std::fs::write(dir.join("env-export.bin"), {
             let mut data = vec![0u8; amlogic::ENV_SIZE];
             data[..1].copy_from_slice(b"x");
             data
         })
-            .unwrap();
-        // environment_text требует key=value — такое окружение не читается
+        .unwrap();
+        // environment_text requires key=value — such an environment
+        // does not parse
         let result = open_or_start(parent.path(), &test_env("0394A722CE668914"));
         assert!(result.is_err(), "подменённое окружение должно отвергаться");
 
-        // Failed-манифест не продолжается
+        // a Failed manifest is not continued
         let mp = dir.join("manifest.json");
-        let mut m: Manifest =
-            serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
+        let mut m: Manifest = serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
         m.status = Status::Failed;
         m.error = Some("test".into());
         std::fs::write(&mp, serde_json::to_vec_pretty(&m).unwrap()).unwrap();

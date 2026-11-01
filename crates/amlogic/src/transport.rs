@@ -4,7 +4,7 @@
 //! needs semantics the Rockchip transport never grew (per-request
 //! control timeouts, short bulk reads that preserve a partial prefix,
 //! observable zero-length packets and a port reset) — see the spec
-//! («Amlogic A113X USB Protocol Specification», разделы 8 и 18).
+//! («Amlogic A113X USB Protocol Specification», sections 8 and 18).
 //!
 //! nusb rides the OS USB stack directly on Linux/macOS and the built-in
 //! WinUSB driver on Windows, so no libusb and no kernel patches are

@@ -1,22 +1,25 @@
-//! capsula-jb — джейлбрейк колонок VK Capsula перезаписью userspace:
-//! userdata не подписан и свободно перезаписывается — кладём в него
-//! оверлей с adbd, остальное не трогаем.
+//! capsula-jb — the VK Capsula userspace jailbreak CLI: backup /
+//! userdata-overlay / monitor. The data partition is not signed and is
+//! freely rewritable — the overlay with adbd goes into it, everything
+//! else stays untouched.
 //!
-//! main — входная точка: разбор аргументов, выбор платформенного
-//! бэкенда по USB-устройству на шине и запуск сценария. Вся логика
-//! платформы — в модулях-бэкендах (контракт — `backend::Backend`;
-//! сегодня это `rockchip` и `amlogic`).
+//! main — the entry point: argument parsing, platform selection by the
+//! USB device on the bus (jb-cli/src/backend.rs) and the confirmation
+//! prompt. The scenario skeleton lives in jb-core (`scenario`), the
+//! platform implementations in the jb-rockchip / jb-amlogic crates.
 
-mod amlogic;
 mod backend;
 mod logging;
 mod progress;
-mod rockchip;
 mod util;
 
 use anyhow::bail;
 use clap::{Parser, Subcommand};
-use std::time::{Duration, Instant};
+
+use jb_core::format::humansize;
+use jb_core::progress::Progress;
+use jb_core::scenario::{Params, WritePlan};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -25,20 +28,20 @@ use std::time::{Duration, Instant};
     about = "Джейлбрейк VK Capsula: дамп → оверлей adbd в userdata → ADB"
 )]
 struct Cli {
-    /// Сколько секунд ждать колонку на USB (0 = бесконечно)
+    /// How many seconds to wait for the speaker on USB (0 = forever)
     #[arg(long, value_name = "SEC", default_value = "0")]
     wait: u64,
 
-    /// Не спрашивать подтверждение перед записью userdata (скрипты)
+    /// Do not ask for confirmation before writing userdata (for scripts)
     #[arg(long)]
     yes: bool,
 
-    /// Собрать чистый ext2 вместо патча дампа (содержимое userdata теряется)
+    /// Build a clean image instead of patching the dump (contents are lost)
     #[arg(long)]
     format_userdata: bool,
 
-    /// Не проверять и не снимать бэкап: userdata собирается с нуля
-    /// (содержимое теряется; крайние случаи — например, битый каталог)
+    /// Skip backup verification and capture: the image is built from
+    /// scratch (contents are lost; edge cases — e.g. a broken directory)
     #[arg(long)]
     no_backup: bool,
 
@@ -48,22 +51,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Только дамп разделов в backup/ (на колонку не пишется)
+    /// Only dump the partitions into backup/ (nothing is written to the speaker)
     Backup,
-    /// Живой лог USB-событий
+    /// Restore the data partition from the verified backup (the
+    /// jailbreak rollback)
+    Restore,
+    /// Live log of USB events
     Monitor,
-    /// Amlogic-мини: identify платы и пасстру u-boot burning-команд
-    /// (диагностика; пример: capsula-jb aml "printenv bootdelay")
+    /// Amlogic Mini: identify the board and pass through u-boot burning
+    /// commands (diagnostics; example: capsula-jb aml "printenv bootdelay")
     Aml {
-        /// Команды по очереди; без команд — только identify
+        /// Commands one by one; with no commands — identify only
         #[arg(value_name = "CMD")]
         cmds: Vec<String>,
     },
 }
 
 fn main() -> anyhow::Result<()> {
-    // Логгер — первым: весь вывод инструмента (включая финальную ошибку)
-    // идёт через него, с метками до миллисекунд.
+    // The logger comes first: all tool output (including the final
+    // error) goes through it, with millisecond timestamps.
     logging::init();
     // An elevated relaunch (Windows UAC manifest) may start in
     // C:\Windows\System32; the tool writes backup/work relative to
@@ -77,9 +83,9 @@ fn main() -> anyhow::Result<()> {
     } else {
         Some(Duration::from_secs(cli.wait))
     };
-    // Сценарий — во внутренней функции: ни `?`, ни `bail!` внутри неё не
-    // прокидывают ошибку мимо перехвата ниже (иначе рантайм печатает
-    // «Error: …» без метки времени).
+    // The scenario lives in an inner function: neither `?` nor `bail!`
+    // inside it lets an error slip past the interception below
+    // (otherwise the runtime prints «Error: …» without a timestamp).
     let result = run(cli, wait);
     if let Err(e) = &result {
         log::error!("{e:?}");
@@ -91,105 +97,69 @@ fn main() -> anyhow::Result<()> {
     win_drv::pause_if_own_console();
     match result {
         Ok(()) => Ok(()),
-        // Ошибка уже залогирована с меткой времени; выходим молча и с
-        // кодом 1, чтобы рантайм не напечатал её второй раз («Error: …»).
+        // The error is already logged with a timestamp; exit silently
+        // with code 1 so the runtime does not print it a second time
+        // («Error: …»).
         Err(_) => std::process::exit(1),
     }
 }
 
-/// Разбор подкоманды и запуск сценария; все ошибки — через возвращаемое
-/// значение (перехватываются в main и логируются с меткой времени).
+/// Parse the subcommand and run the scenario; all errors go through
+/// the return value (intercepted in main and logged with a timestamp).
 fn run(cli: Cli, wait: Option<Duration>) -> anyhow::Result<()> {
+    let p = progress::CliProgress::new();
+    let progress = |ev: Progress| p.handle(ev);
     match cli.command {
-        None => pick_backend(wait)?.jailbreak(cli.yes, cli.format_userdata, cli.no_backup, wait),
+        None => {
+            let params = Params {
+                format_userdata: cli.format_userdata,
+                no_backup: cli.no_backup,
+                wait,
+            };
+            let confirm = confirm_write(cli.yes);
+            backend::pick_backend(wait)?.jailbreak(&params, &confirm, &progress)
+        }
         Some(Command::Backup) => {
             if cli.no_backup {
                 bail!("--no-backup несовместим с подкомандой backup");
             }
-            pick_backend(wait)?.backup(wait)
+            backend::pick_backend(wait)?.backup(wait, &progress)
         }
-        // Монитор не ждёт устройства и не строит драйверную сессию —
-        // только живой лог шины.
+        Some(Command::Restore) => {
+            if cli.no_backup {
+                bail!("--no-backup несовместим с подкомандой restore");
+            }
+            let confirm = confirm_write(cli.yes);
+            backend::pick_backend(wait)?.restore(wait, &confirm, &progress)
+        }
+        // The monitor does not wait for a device and does not build a
+        // driver session — just the live bus log.
         Some(Command::Monitor) => monitor_bus(),
-        // Пасстру — диагностика Amlogic-мин, вне основного сценария.
-        Some(Command::Aml { cmds }) => amlogic::passthrough(wait, &cmds),
+        // Passthrough is Amlogic Mini diagnostics, outside the main scenario.
+        Some(Command::Aml { cmds }) => {
+            jb_amlogic::diag::passthrough(wait, &cmds, &progress)
+        }
     }
 }
 
-/// Все известные платформы в порядке опроса. Будущая платформа
-/// добавляется сюда: опознаётся по своему USB-устройству (`present`),
-/// сценарий — через тот же контракт `backend::Backend`.
-fn backends() -> Vec<Box<dyn backend::Backend>> {
-    vec![
-        Box::new(rockchip::Rockchip::new()),
-        Box::new(amlogic::Amlogic::new()),
-    ]
-}
-
-/// Выбор бэкенда по USB-устройству на шине: ждём, пока появится
-/// устройство любой известной платформы, и отдаём её бэкенд. Пока шина
-/// пуста, печатаем подсказки платформ (как войти в download-режим).
-fn pick_backend(wait: Option<Duration>) -> anyhow::Result<Box<dyn backend::Backend>> {
-    let start = Instant::now();
-    let mut candidates = backends();
-    let mut hint_shown = false;
-    loop {
-        let mut chosen: Option<usize> = None;
-        for (i, b) in candidates.iter().enumerate() {
-            if b.present()? {
-                chosen = Some(i);
-                break;
-            }
+/// Write confirmation (skipped with --yes). The skeleton calls it after
+/// measuring the partition and BEFORE any writing action — a refusal is
+/// safe. One wording for all platforms: the partition name, size and
+/// mode description come from the platform's WritePlan.
+fn confirm_write(yes: bool) -> impl Fn(&WritePlan) -> anyhow::Result<()> {
+    move |plan: &WritePlan| {
+        if yes {
+            return Ok(());
         }
-        if let Some(i) = chosen {
-            let b = candidates.swap_remove(i);
-            log::info!("платформа: {}", b.name());
-            return Ok(b);
-        }
-        if !hint_shown {
-            for b in &candidates {
-                if let Some(h) = b.wait_hint() {
-                    log::info!("{h}");
-                }
-            }
-            hint_shown = true;
-        }
-        if let Some(t) = wait {
-            if start.elapsed() >= t {
-                bail!("ни одна поддерживаемая платформа не появилась на шине (--wait)");
-            }
-        }
-        std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
-    }
-}
-
-/// Живой лог USB-событий обоих вендоров: rockchip-монитор (2207:*) плюс
-/// отслеживание появления/пропадания 1b8e:c003.
-fn monitor_bus() -> anyhow::Result<()> {
-    log::info!("Монитор USB (2207:* rockchip, 1b8e:c003 amlogic), Ctrl-C — выход.");
-    let mut m = rockusb::DeviceMonitor::new();
-    let mut amlogic_on_bus = ::amlogic::present().unwrap_or(false);
-    m.poll()?;
-    if let Some(best) = rockusb::transport::DeviceMode::best(m.modes()) {
-        log::info!("сейчас на шине: 2207:{:04x} ({})", best.pid(), best.label());
-    }
-    if amlogic_on_bus {
-        log::info!("сейчас на шине: 1b8e:c003 (amlogic download)");
-    }
-    loop {
-        // события 2207:* логирует сам rockusb::DeviceMonitor (usb:
-        // appeared/gone); здесь следим только за amlogic-гаджетом.
-        m.poll()?;
-        let now = ::amlogic::present().unwrap_or(amlogic_on_bus);
-        if now != amlogic_on_bus {
-            if now {
-                log::info!("появился 1b8e:c003 (amlogic download)");
-            } else {
-                log::info!("пропал   1b8e:c003 (amlogic download)");
-            }
-            amlogic_on_bus = now;
-        }
-        std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
+        let verb = if plan.restore { "восстановление" } else { "запись" };
+        log::info!(
+            "{verb} {} ({}): {}",
+            plan.partition,
+            humansize(plan.size),
+            plan.mode
+        );
+        log::info!("продолжить? [y/N]");
+        ask_yes()
     }
 }
 
@@ -213,4 +183,34 @@ fn ask_yes() -> anyhow::Result<()> {
         bail!("прервано пользователем");
     }
     Ok(())
+}
+
+/// Live log of USB events from both vendors: the rockchip monitor
+/// (2207:*) plus tracking the appearance/disappearance of 1b8e:c003.
+fn monitor_bus() -> anyhow::Result<()> {
+    log::info!("Монитор USB (2207:* rockchip, 1b8e:c003 amlogic), Ctrl-C — выход.");
+    let mut m = rockusb::DeviceMonitor::new();
+    let mut amlogic_on_bus = ::amlogic::present().unwrap_or(false);
+    m.poll()?;
+    if let Some(best) = rockusb::transport::DeviceMode::best(m.modes()) {
+        log::info!("сейчас на шине: 2207:{:04x} ({})", best.pid(), best.label());
+    }
+    if amlogic_on_bus {
+        log::info!("сейчас на шине: 1b8e:c003 (amlogic download)");
+    }
+    loop {
+        // 2207:* events are logged by rockusb::DeviceMonitor itself (usb:
+        // appeared/gone); here we only watch the amlogic gadget.
+        m.poll()?;
+        let now = ::amlogic::present().unwrap_or(amlogic_on_bus);
+        if now != amlogic_on_bus {
+            if now {
+                log::info!("появился 1b8e:c003 (amlogic download)");
+            } else {
+                log::info!("пропал   1b8e:c003 (amlogic download)");
+            }
+            amlogic_on_bus = now;
+        }
+        std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
+    }
 }

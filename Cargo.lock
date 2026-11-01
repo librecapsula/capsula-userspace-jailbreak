@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -453,6 +459,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jb-amlogic"
+version = "0.1.5"
+dependencies = [
+ "amlogic",
+ "anyhow",
+ "env_logger",
+ "hex",
+ "jb-core",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "ubifs",
+]
+
+[[package]]
 name = "jb-cli"
 version = "0.1.5"
 dependencies = [
@@ -462,7 +485,9 @@ dependencies = [
  "embed-resource",
  "env_logger",
  "indicatif",
+ "jb-amlogic",
  "jb-core",
+ "jb-rockchip",
  "log",
  "rockusb",
  "win-drv",
@@ -472,19 +497,31 @@ dependencies = [
 name = "jb-core"
 version = "0.1.5"
 dependencies = [
- "amlogic",
  "anyhow",
- "cc",
- "crc32fast",
- "ext4-lwext4",
  "hex",
  "log",
- "rockusb",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.21",
  "toml",
+]
+
+[[package]]
+name = "jb-rockchip"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "cc",
+ "crc32fast",
+ "ext4-lwext4",
+ "hex",
+ "jb-core",
+ "log",
+ "rockusb",
+ "sha2",
+ "thiserror 2.0.21",
+ "win-drv",
 ]
 
 [[package]]
@@ -554,6 +591,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "lzo"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1574f8e322bb9d442095896ff66d126e521f5a85ef7d7343a269bb7d6eeb3f0b"
+
+[[package]]
 name = "mach2"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -567,6 +610,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
 
 [[package]]
 name = "nusb"
@@ -680,6 +732,12 @@ dependencies = [
  "nusb",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "rust-lzo1x"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fd08cac3694f478b11379ad5e198d839827d6f0d8fa3b5c3a593e95cf6e8522"
 
 [[package]]
 name = "rustc_version"
@@ -911,6 +969,17 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "ubifs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bd0e66b3af7486ccd0e2731741716f6165673f278e9746f8658d18902c70715"
+dependencies = [
+ "lzo",
+ "miniz_oxide",
+ "rust-lzo1x",
+]
 
 [[package]]
 name = "unicode-ident"

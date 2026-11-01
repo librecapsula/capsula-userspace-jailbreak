@@ -14,13 +14,13 @@
 //!
 //!   cargo run -p jb-core --example readsize --release
 
-use jb_core::backup::patch_read_limit;
+use jb_rockchip::backup::patch_read_limit;
 use jb_core::config::Config;
-use jb_core::session::{bring_up, BringUpError, UsbBus};
+use jb_rockchip::session::{bring_up, BringUpError, UsbBus};
 
 fn main() -> anyhow::Result<()> {
     let config = Config::embedded();
-    let loader = jb_core::loader::embedded()?;
+    let loader = jb_rockchip::loader::embedded()?;
     let mut bus = UsbBus;
     let up = match bring_up(&mut bus, &config, &loader, None, false, &|_| {}) {
         Ok(v) => v,

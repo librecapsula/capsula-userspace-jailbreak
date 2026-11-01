@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 jb-core = { workspace = true }
+jb-rockchip = { workspace = true }
+jb-amlogic = { workspace = true }
 rockusb = { workspace = true }
 amlogic = { workspace = true }
 anyhow = { workspace = true }

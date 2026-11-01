@@ -4,7 +4,7 @@
 
 use crate::backup::CHUNK_SECTORS;
 use crate::gpt::Gpt;
-use crate::session::{Progress, ProgressFn};
+use jb_core::progress::{Progress, ProgressFn};
 use rockusb::loader::LoaderSession;
 use rockusb::{Error as UsbError, Transport};
 use std::io::Read;

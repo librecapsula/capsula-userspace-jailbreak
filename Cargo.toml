@@ -4,6 +4,8 @@ members = [
     "crates/rockusb",
     "crates/amlogic",
     "crates/jb-core",
+    "crates/jb-rockchip",
+    "crates/jb-amlogic",
     "crates/jb-cli",
     "crates/win-drv",
 ]
@@ -19,6 +21,8 @@ repository = "https://github.com/LibreCapsula/capsula-userspace-jailbreak"
 rockusb = { path = "crates/rockusb" }
 amlogic = { path = "crates/amlogic" }
 jb-core = { path = "crates/jb-core" }
+jb-rockchip = { path = "crates/jb-rockchip" }
+jb-amlogic = { path = "crates/jb-amlogic" }
 win-drv = { path = "crates/win-drv" }
 
 # usb / protocol
@@ -41,6 +45,10 @@ hex = "0.4"
 # userdata overlay: ext2/3/4 via lwext4 (compiled with cc, no runtime deps)
 ext4-lwext4 = "0.1"
 cc = "1"
+
+# the amlogic data partition is UBI/UBIFS: read the capture, inject the
+# overlay, repack (mkfs.ubifs/ubinize-compatible, pure Rust)
+ubifs = "0.1"
 
 # cli / progress / gui
 clap = { version = "4", features = ["derive"] }

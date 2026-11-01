@@ -186,9 +186,10 @@ pub fn append_sha256_line(dir: &Path, file_name: &str, hex: &str) -> std::io::Re
     writeln!(f, "{hex}  {file_name}")
 }
 
-/// Имя файла захвата: только безопасные символы, без пути (файлы
-/// захвата пишутся в каталог захвата и не могут из него выйти).
-pub(crate) fn safe_capture_name(name: &str) -> std::io::Result<()> {
+/// Capture file name check: only safe characters, no path separators
+/// (capture files are written inside the capture directory and cannot
+/// escape it).
+pub fn safe_capture_name(name: &str) -> std::io::Result<()> {
     if name.is_empty()
         || name == "."
         || name == ".."
@@ -204,17 +205,18 @@ pub(crate) fn safe_capture_name(name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Новый захват всегда владеет своим каталогом и никогда не переоткрывает
-/// старый бэкап на запись (формат amlogic-захвата: manifest.json + файлы;
-/// отличается от legacy-каталога rockchip). Общие файловые операции, не
-/// зависящие от GPT или NAND.
-pub(crate) struct CaptureDirectory {
+/// A new capture always owns its directory and never reopens an old
+/// backup for writing (the amlogic capture format: manifest.json +
+/// files; distinct from the legacy rockchip directory). Generic file
+/// operations that do not depend on GPT or NAND.
+pub struct CaptureDirectory {
     path: PathBuf,
 }
 
 impl CaptureDirectory {
-    #[cfg(test)]
-    pub(crate) fn create(parent: &Path, prefix: &str) -> std::io::Result<Self> {
+    /// Create a uniquely-named capture directory (tests and tools that
+    /// need an ad-hoc capture location).
+    pub fn create(parent: &Path, prefix: &str) -> std::io::Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         safe_capture_name(prefix)?;
@@ -247,9 +249,9 @@ impl CaptureDirectory {
         ))
     }
 
-    /// Каталог с фиксированным именем (бэкап по серийнику устройства):
-    /// создаётся только если его ещё нет, права 0700.
-    pub(crate) fn create_with_name(parent: &Path, name: &str) -> std::io::Result<Self> {
+    /// Directory with a fixed name (the per-serial backup): created only
+    /// when it does not exist yet, mode 0700.
+    pub fn create_with_name(parent: &Path, name: &str) -> std::io::Result<Self> {
         safe_capture_name(name)?;
         std::fs::create_dir_all(parent)?;
         let path = parent.join(name);
@@ -263,9 +265,10 @@ impl CaptureDirectory {
         Ok(Self { path })
     }
 
-    /// Переоткрыть каталог идущего захвата (чекпоинт-цикл по окнам:
-    /// манифест и .partial-файлы — состояние между окнами).
-    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+    /// Reopen the directory of an ongoing capture (the checkpoint cycle
+    /// across windows: the manifest and the .partial files are the state
+    /// between windows).
+    pub fn open(path: &Path) -> std::io::Result<Self> {
         if !std::fs::symlink_metadata(path)?.file_type().is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -277,11 +280,11 @@ impl CaptureDirectory {
         })
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) fn create_file(&self, name: &str) -> std::io::Result<std::fs::File> {
+    pub fn create_file(&self, name: &str) -> std::io::Result<std::fs::File> {
         safe_capture_name(name)?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -293,7 +296,7 @@ impl CaptureDirectory {
         options.open(self.path.join(name))
     }
 
-    pub(crate) fn write_file(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
+    pub fn write_file(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
         self.require_absent(name)?;
         let partial = format!("{name}.partial");
@@ -304,9 +307,10 @@ impl CaptureDirectory {
         self.publish_partial(&partial, name)
     }
 
-    /// Атомарная замена (manifest.json пишется по мере прохождения
-    /// захвата): временный файл + rename, промахи чистят за собой.
-    pub(crate) fn replace_file(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
+    /// Atomic replacement (manifest.json is rewritten as the capture
+    /// progresses): temp file + rename, failures clean up their temp
+    /// file.
+    pub fn replace_file(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
         safe_capture_name(name)?;
         let temp = format!(".{name}.tmp");
@@ -323,7 +327,7 @@ impl CaptureDirectory {
         result
     }
 
-    pub(crate) fn publish_partial(&self, partial: &str, name: &str) -> std::io::Result<()> {
+    pub fn publish_partial(&self, partial: &str, name: &str) -> std::io::Result<()> {
         safe_capture_name(partial)?;
         self.require_absent(name)?;
         if !std::fs::symlink_metadata(self.path.join(partial))?

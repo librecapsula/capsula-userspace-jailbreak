@@ -4,7 +4,8 @@
 //! no hardware.
 
 use jb_core::config::Config;
-use jb_core::session::{bring_up, BringUpError, Bus, Progress};
+use jb_core::progress::Progress;
+use jb_rockchip::session::{bring_up, BringUpError, Bus};
 use rockusb::loader::{opcode, LoaderSession};
 use rockusb::mock::{MockTransport, Step};
 use rockusb::{DeviceMode, LoaderContainer};
@@ -268,7 +269,7 @@ impl Bus for FakeBus {
 fn run(
     bus: &mut FakeBus,
     no_backup: bool,
-) -> Result<jb_core::session::BroughtUp<MockTransport>, BringUpError> {
+) -> Result<jb_rockchip::session::BroughtUp<MockTransport>, BringUpError> {
     let config = Config::embedded();
     let loader = synth_loader();
     let progress = |_: Progress| {};

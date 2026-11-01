@@ -1,9 +1,9 @@
-//! Вшитый лоадер: подписанный BOOT-контейнер (DDR init 0x471 + usbplug
-//! 0x472), извлечённый из OTA Capsule-14 44.90. Один лоадер на все
-//! поддерживаемые платы — во всех актуальных прошивках rk3308 это одна
-//! и та же сборка.
+//! The embedded loader: a signed BOOT container (DDR init 0x471 +
+//! usbplug 0x472) extracted from OTA Capsule-14 44.90. One loader for
+//! every supported board — all current rk3308 firmware ships the same
+//! build.
 //!
-//! Лоадер зашит в бинарник; сеть инструменту не нужна.
+//! The loader is embedded in the binary; the tool needs no network.
 
 use rockusb::{Error as UsbError, LoaderContainer};
 use std::sync::OnceLock;

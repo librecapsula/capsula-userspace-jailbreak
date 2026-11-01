@@ -1,17 +1,18 @@
-//! Единый логгер CLI: весь вывод инструмента идёт через крейт `log` —
-//! и шаги сценария, и сообщения доменных крейтов (rockusb, amlogic,
-//! jb-core). Формат строки — `HH:MM:SS.mmm LEVEL  сообщение`
-//! (UTC, миллисекунды; уровень обязателен — INFO/WARN/ERROR/DEBUG).
-//! Вывод в stdout: весь лог в одном потоке, `> файл` ловит всё.
-//! Уровень — RUST_LOG (по умолчанию info).
+//! The unified CLI logger: all tool output goes through the `log`
+//! crate — both scenario steps and messages from the domain crates
+//! (rockusb, amlogic, jb-core). Line format is
+//! `HH:MM:SS.mmm LEVEL  message` (UTC, milliseconds; the level is
+//! mandatory — INFO/WARN/ERROR/DEBUG). Output to stdout: the whole log
+//! in one stream, `> file` captures everything. The level comes from
+//! RUST_LOG (info by default).
 
 use crate::progress;
 use crate::util::ts_ms;
 use log::{Log, Metadata, Record};
 use std::io::Write;
 
-/// Инициализировать глобальный логгер; вызывается один раз в начале
-/// main, до любого вывода.
+/// Initialize the global logger; called once at the start of main,
+/// before any output.
 pub fn init() {
     let inner = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
@@ -26,15 +27,16 @@ pub fn init() {
         .target(env_logger::Target::Stdout)
         .build();
     log::set_max_level(inner.filter());
-    // Дубликат логгера невозможен (set_boxed_logger в main первым делом),
-    // сбой здесь значит ошибку программирования — молча продолжать не
-    // надо, но и ронять CLI из-за этого не стоит.
+    // A duplicate logger is impossible (set_boxed_logger is the very
+    // first thing main does), so a failure here means a programming
+    // error — silently continuing is wrong, but crashing the CLI over
+    // it is not worth it either.
     let _ = log::set_boxed_logger(Box::new(BarAware { inner }));
 }
 
-/// Логгер, уступающий строку активной progress-полосе: предупреждения
-/// из доменных крейтов приходят и посреди передачи, и без suspend
-/// отрисовка бара затирала бы их на терминале.
+/// A logger that yields the line to the active progress bar: warnings
+/// from the domain crates arrive mid-transfer too, and without suspend
+/// the bar rendering would overwrite them on the terminal.
 struct BarAware {
     inner: env_logger::Logger,
 }

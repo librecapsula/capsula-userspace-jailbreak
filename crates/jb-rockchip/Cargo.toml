@@ -1,0 +1,22 @@
+[package]
+name = "jb-rockchip"
+description = "capsula-jailbreak rockchip platform (RK3308): bring-up over the rockusb loader, full GPT dump, ext4 userdata overlay, WRITE_LBA flash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[build-dependencies]
+cc = { workspace = true }
+
+[dependencies]
+jb-core = { workspace = true }
+rockusb = { workspace = true }
+win-drv = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+sha2 = { workspace = true }
+crc32fast = { workspace = true }
+hex = { workspace = true }
+ext4-lwext4 = { workspace = true }

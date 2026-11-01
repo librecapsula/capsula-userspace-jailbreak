@@ -1,0 +1,22 @@
+[package]
+name = "jb-amlogic"
+description = "capsula-jailbreak amlogic platform (A113X Mini): download-window bring-up, checkpoint NAND capture, UBIFS data-image repack, chunked window write"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jb-core = { workspace = true }
+amlogic = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+ubifs = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }

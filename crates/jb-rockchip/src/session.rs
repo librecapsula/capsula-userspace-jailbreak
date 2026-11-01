@@ -11,48 +11,13 @@
 //! (their locked BootROM rejects our loader anyway) and `--no-backup`
 //! runs. The caller then runs the no-backup userdata flow.
 
-use crate::config::Config;
 use crate::firstgen::is_first_generation;
+use jb_core::config::Config;
+use jb_core::progress::{Progress, ProgressFn};
 use rockusb::loader::{LoaderSession, RESET_SUBCODE_MASKROM};
 use rockusb::monitor::wait_download_mode;
 use rockusb::{Error as UsbError, LoaderContainer, MaskRomSession, NusbTransport, Transport};
 use std::time::{Duration, Instant};
-
-/// Progress events for CLI/GUI.
-#[derive(Debug, Clone)]
-pub enum Progress {
-    /// A human-readable progress line.
-    Step(String),
-    PartitionStart {
-        name: String,
-        sectors: u64,
-    },
-    PartitionProgress {
-        name: String,
-        done: u64,
-        total: u64,
-    },
-    PartitionDone {
-        name: String,
-    },
-    /// Байтовая передача (amlogic-потоки: захват разделов, полный дамп
-    /// NAND, запись раздела) — те же события, что и Partition*, но
-    /// единица — байт, а не сектор.
-    TransferStart {
-        name: String,
-        bytes: u64,
-    },
-    TransferProgress {
-        name: String,
-        done: u64,
-        total: u64,
-    },
-    TransferDone {
-        name: String,
-    },
-}
-
-pub type ProgressFn<'a> = &'a dyn Fn(Progress);
 
 /// Bring-up error. `LoaderRejected`: the usbplug did not start — BootROM
 /// silently rejected the loader signature (an unsupported board).
@@ -443,7 +408,7 @@ mod tests {
         assert!(is_identifying(s));
         assert!(!crate::firstgen::is_first_generation(s));
         assert_eq!(
-            crate::backup_store::BackupStore::dir_name(raw),
+            jb_core::backup_store::BackupStore::dir_name(raw),
             "01139EB3613ABD80"
         );
     }

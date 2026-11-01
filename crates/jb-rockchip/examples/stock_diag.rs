@@ -45,7 +45,7 @@ fn main() {
     println!("capability:      {:?}", s.capability());
 
     // ---- GPT: LBA1 + 33 entry sectors ----
-    let gpt = match jb_core::session::read_gpt(&mut s, &|_| {}) {
+    let gpt = match jb_rockchip::session::read_gpt(&mut s, &|_| {}) {
         Ok((g, raw)) => {
             println!("GPT:             ok, {} partitions", g.entries.len());
             for e in &g.entries {

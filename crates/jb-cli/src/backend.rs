@@ -1,41 +1,57 @@
-//! Контракт платформенного бэкенда. main — входная точка: он выбирает
-//! бэкенд по USB-устройству, появившемуся на шине (платформы различаются
-//! по VID:PID), и дальше весь сценарий живёт внутри бэкенда.
-//!
-//! Сегодня бэкендов два — rockchip (RK3308, `crate::rockchip`) и
-//! amlogic (A113X, `crate::amlogic`). Будущая платформа реализует тот
-//! же контракт, опознаётся по своему USB-устройству и добавляется в
-//! `main::backends()`.
+//! Platform dispatch. main — the entry point: argument parsing and
+//! backend selection by the USB device that appears on the bus; the
+//! whole scenario then runs through the `jb_core::backend::Backend`
+//! contract implemented by the platform crates (jb-rockchip,
+//! jb-amlogic). A future platform = a new crate implementing the
+//! contract + a line in `backends()`.
 
-use std::time::Duration;
+use jb_core::backend::Backend;
+use anyhow::bail;
+use std::time::{Duration, Instant};
 
-/// Одна поддерживаемая SoC/платформа.
-pub trait Backend {
-    /// Короткое имя платформы (для лога выбора).
-    fn name(&self) -> &'static str;
+/// Every known platform in poll order. A future platform is added
+/// here: recognized by its own USB device (`present`), the scenario
+/// runs through the same contract.
+pub(crate) fn backends() -> Vec<Box<dyn Backend>> {
+    vec![
+        Box::new(jb_rockchip::platform::Rockchip::new()),
+        Box::new(jb_amlogic::platform::Amlogic::new()),
+    ]
+}
 
-    /// Есть ли на шине устройство этой платформы. Этим main выбирает
-    /// бэкенд; перечисление шины — на совести платформы.
-    fn present(&self) -> anyhow::Result<bool>;
-
-    /// Подсказка на время ожидания устройства (main печатает её, пока
-    /// шина пуста), если у платформы она есть.
-    fn wait_hint(&self) -> Option<&str> {
-        None
+/// Pick a backend by the USB device on the bus: wait until a device of
+/// any known platform appears and return its backend. While the bus is
+/// empty, print the platform hints (how to enter the download mode).
+pub(crate) fn pick_backend(wait: Option<Duration>) -> anyhow::Result<Box<dyn Backend>> {
+    let start = Instant::now();
+    let mut candidates = backends();
+    let mut hint_shown = false;
+    loop {
+        let mut chosen: Option<usize> = None;
+        for (i, b) in candidates.iter().enumerate() {
+            if b.present()? {
+                chosen = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = chosen {
+            let b = candidates.swap_remove(i);
+            log::info!("платформа: {}", b.name());
+            return Ok(b);
+        }
+        if !hint_shown {
+            for b in &candidates {
+                if let Some(h) = b.wait_hint() {
+                    log::info!("{h}");
+                }
+            }
+            hint_shown = true;
+        }
+        if let Some(t) = wait {
+            if start.elapsed() >= t {
+                bail!("ни одна поддерживаемая платформа не появилась на шине (--wait)");
+            }
+        }
+        std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
     }
-
-    /// Полный сценарий: подключение → дамп → оверлей adbd в userdata →
-    /// запись → перезагрузка → ожидание ADB. `no_backup` пропускает и
-    /// проверку, и съём дампа (userdata собирается с нуля) — сценарий
-    /// при этом остаётся на стоковом лоадере, без загрузки своего.
-    fn jailbreak(
-        &mut self,
-        yes: bool,
-        format_userdata: bool,
-        no_backup: bool,
-        wait: Option<Duration>,
-    ) -> anyhow::Result<()>;
-
-    /// Только дамп: на устройство не пишется.
-    fn backup(&mut self, wait: Option<Duration>) -> anyhow::Result<()>;
 }

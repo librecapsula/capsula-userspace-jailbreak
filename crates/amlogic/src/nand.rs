@@ -59,9 +59,9 @@ impl<T: Transport> AmlogicSession<T> {
         Ok(size as usize)
     }
 
-    /// `nand erase <off> <len>` — стирание диапазона логического
-    /// пространства. Идемпотентно: прерванное окно просто повторяет
-    /// команду в следующем. Границы — кратные странице.
+    /// `nand erase <off> <len>` — erasing a range of the logical
+    /// address space. Idempotent: an interrupted window simply repeats
+    /// the command in the next one. Bounds are page multiples.
     pub fn nand_erase(&mut self, offset: u32, len: u32) -> Result<()> {
         if len == 0
             || !offset.is_multiple_of(PAGE_SIZE)

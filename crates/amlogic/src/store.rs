@@ -7,24 +7,25 @@ use crate::transport::Transport;
 use crate::{AmlogicSession, MEDIA_CHUNK};
 use std::io::Read;
 
-/// Размер куска флэшер-записи (flasher.sh MWRITE_CHUNK=8 МиБ уменьшен
-/// до бюджета окна: стена ~250–350 мс убивает сессию на кусках
-/// крупнее 1 МиБ — то же измерение, что задало READ_STAGE).
+/// Size of one flasher write chunk (flasher.sh MWRITE_CHUNK=8 MiB
+/// shrunk to the window budget: the ~250–350 ms wall kills the session
+/// on chunks larger than 1 MiB — the same measurement that set
+/// READ_STAGE).
 pub const NAND_WRITE_CHUNK: usize = 0x10_0000;
 
 impl<T: Transport> AmlogicSession<T> {
-    /// Один кусок флэшер-записи (flasher.sh `write_big_to_flash`):
-    /// отправить `len` байт из `data` в ОЗУ по адресу `ram` — постановка
-    /// `download mem` через TPL-канал (статус сразу), media-пакеты,
-    /// `download get_status` — и затем `nand write` куска во флеш по
-    /// логическому смещению `off`.
+    /// One flasher write chunk (flasher.sh `write_big_to_flash`): send
+    /// `len` bytes from `data` into RAM at `ram` — arming `download mem`
+    /// via the TPL channel (status right away), media packets,
+    /// `download get_status` — and then `nand write` the chunk to flash
+    /// at logical offset `off`.
     ///
-    /// Кусок атомарен настолько, насколько это даёт устройство: если
-    /// сессия умирает в media-потоке или на `nand write`, состояние
-    /// куска во флеше неопределено — вызывающий повторяет ТОТ ЖЕ кусок
-    /// после стирания остатка диапазона (перепрограммирование частично
-    /// запрограммированной страницы портит её, поэтому повтор всегда
-    /// идёт после `nand erase`, см. jb-core `write_data_pass`).
+    /// The chunk is as atomic as the device allows: if the session dies
+    /// in the media stream or during `nand write`, the chunk's state in
+    /// flash is undefined — the caller retries THE SAME chunk after
+    /// erasing the rest of the range (reprogramming a partially
+    /// programmed page corrupts it, so a retry always goes after
+    /// `nand erase`, see jb-core `write_data_pass`).
     pub fn write_nand_chunk<R: Read>(
         &mut self,
         ram: u32,
@@ -61,11 +62,11 @@ impl<T: Transport> AmlogicSession<T> {
             sent += want;
             seq += 1;
         }
-        // устройство дописало кусок в ОЗУ
+        // the device has finished writing the chunk into RAM
         let status = self.bulk_cmd("download get_status")?;
         log::debug!("amlogic: download mem get_status: {status}");
-        // запись куска во флеш по логическому смещению (u-boot сам
-        // обходит бед-блоки)
+        // write the chunk to flash at the logical offset (u-boot skips
+        // bad blocks itself)
         self.bulk_cmd(&format!("echo; nand write {ram:#x} {off:#x} {len:#x}"))?;
         Ok(())
     }

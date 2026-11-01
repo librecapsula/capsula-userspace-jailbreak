@@ -2,9 +2,10 @@
 //! Bring-up (MaskROM -> loader into RAM -> signatures) is done by the
 //! session BEFORE this is called.
 
-use crate::backup_store::{append_sha256_line, file_sha256};
-use crate::config::Config;
-use crate::session::{read_gpt, Progress, ProgressFn};
+use jb_core::backup_store::{append_sha256_line, file_sha256};
+use jb_core::config::Config;
+use crate::session::read_gpt;
+use jb_core::progress::{Progress, ProgressFn};
 use rockusb::loader::LoaderSession;
 use rockusb::{Error as UsbError, Transport};
 use sha2::{Digest, Sha256};
@@ -128,7 +129,7 @@ pub fn backup<T: Transport>(
 
     let mut masked: Vec<String> = Vec::new();
     for e in &gpt.entries {
-        let file_name = crate::backup_store::BackupStore::image_name(e.idx, &e.name);
+        let file_name = jb_core::backup_store::BackupStore::image_name(e.idx, &e.name);
         let path = out_dir.join(&file_name);
         progress(Progress::PartitionStart {
             name: e.name.clone(),

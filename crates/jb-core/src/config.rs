@@ -28,8 +28,8 @@ pub struct UsbplugPatch {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Hint {
     pub text: String,
-    /// Подсказка для Amlogic-мин (1b8e:c003): короткое download-окно
-    /// поднимается само на каждом включении — нажимать ничего не надо.
+    /// The hint for the amlogic Mini (1b8e:c003): the short download
+    /// window raises itself at every power-on — nothing to press.
     pub amlogic_text: String,
 }
 
